@@ -18,7 +18,7 @@ Sistema de controle financeiro para consultas de fonoaudiologia da **Vitalab Med
 - **Banco de dados**: Supabase (PostgreSQL)
 - **ORM**: Prisma
 - **Autenticação**: NextAuth.js v5
-- **IA/OCR**: Anthropic API (Claude Sonnet)
+- **IA/OCR**: Google Gemini API (Gemini 1.5 Flash Free Tier)
 - **Exportação Excel**: SheetJS (xlsx)
 - **Deploy**: Vercel
 
@@ -41,7 +41,7 @@ cp .env.example .env.local
 Variáveis necessárias:
 - `DATABASE_URL` — URL de conexão Supabase (porta 6543, transaction mode)
 - `DIRECT_URL` — URL direta Supabase (porta 5432, para migrações)
-- `ANTHROPIC_API_KEY` — Chave da API Anthropic
+- `GEMINI_API_KEY` — Chave da API Google Gemini (AI Studio)
 - `NEXTAUTH_SECRET` — Gere com: `openssl rand -base64 32`
 - `NEXTAUTH_URL` — `http://localhost:3000`
 

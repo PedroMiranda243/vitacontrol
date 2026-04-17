@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@/auth'
-import { extractOSData, extractRepasseData, parseExtractedJSON } from '@/lib/anthropic'
+import { extractOSData, extractRepasseData } from '@/lib/gemini'
 
 export async function POST(request: NextRequest) {
   const session = await auth()
@@ -27,20 +27,17 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    let rawResponse: string
+    let data
 
     if (tipo === 'OS') {
-      rawResponse = await extractOSData(image)
+      data = await extractOSData(image)
     } else {
-      rawResponse = await extractRepasseData(image)
+      data = await extractRepasseData(image)
     }
-
-    const data = parseExtractedJSON(rawResponse)
 
     return NextResponse.json({
       success: true,
       data,
-      rawResponse,
     })
   } catch (error) {
     console.error('Extraction error:', error)
