@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  VIEWER
+}
+
+enum Status {
+  EM_ABERTO
+  PAGO
+  VENCIDO
+  OK
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String
+  role      Role     @default(VIEWER)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+model Record {
+  id             String    @id @default(cuid())
+  dataLancamento DateTime  @map("data_lancamento")
+  os             String
+  examesOs       String?   @map("exames_os")
+  descricao      String
+  exame          String?
+  empresa        String?
+  valor          Float
+  dataVencimento DateTime  @map("data_vencimento")
+  pago           Boolean   @default(false)
+  dataPagamento  DateTime? @map("data_pagamento")
+  status         Status    @default(EM_ABERTO)
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@map("records")
+}
+
+model UploadLog {
+  id          String   @id @default(cuid())
+  tipo        String
+  fileName    String   @map("file_name")
+  recordCount Int      @map("record_count")
+  details     String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("upload_logs")
+}
