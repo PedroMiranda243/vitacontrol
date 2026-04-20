@@ -8,18 +8,6 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-enum Role {
-  ADMIN
-  VIEWER
-}
-
-enum Status {
-  EM_ABERTO
-  PAGO
-  VENCIDO
-  OK
-}
-
 model User {
   id        String   @id @default(cuid())
   email     String   @unique
@@ -60,4 +48,16 @@ model UploadLog {
   createdAt   DateTime @default(now()) @map("created_at")
 
   @@map("upload_logs")
+}
+
+enum Role {
+  ADMIN
+  VIEWER
+}
+
+enum Status {
+  EM_ABERTO
+  PAGO
+  VENCIDO
+  OK
 }
