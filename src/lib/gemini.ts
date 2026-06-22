@@ -69,7 +69,7 @@ Sua missão é extrair todas as linhas da tabela e converter num JSON puro (sem 
 - Sem aspas no início, sem markdown, SOMENTE o JSON.`
 
 export async function extractOSData(base64Image: string): Promise<ExtractedOSData[]> {
-  const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' })
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
 
   // Extrair tipo de conteúdo (ex: image/jpeg) e dados brutos do base64 gerado pelo frontend
   const matches = base64Image.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/)
@@ -108,7 +108,7 @@ export async function extractOSData(base64Image: string): Promise<ExtractedOSDat
 }
 
 export async function extractRepasseData(base64Image: string): Promise<RepasseExtractionResult> {
-  const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' })
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' })
 
   const matches = base64Image.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/)
   if (!matches || matches.length !== 3) {
