@@ -138,17 +138,35 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    const incomingOsList = records.map((r: any) => r.os)
+    
+    // Buscar registros existentes para evitar duplicatas (mesma OS e mesmo Exame)
+    const existingRecords = await prisma.record.findMany({
+      where: {
+        os: { in: incomingOsList }
+      },
+      select: { os: true, exame: true }
+    })
+    
+    const existingSet = new Set(existingRecords.map(r => `${r.os}-${r.exame || ''}`))
+    
+    const newRecords = records.filter((r: any) => {
+      const key = `${r.os}-${r.exame || ''}`
+      if (existingSet.has(key)) return false
+      // Adiciona no set para evitar duplicatas dentro do próprio envio
+      existingSet.add(key)
+      return true
+    })
+
+    if (newRecords.length === 0) {
+      return NextResponse.json(
+        { error: 'Todos os registros desta imagem já foram cadastrados anteriormente.' },
+        { status: 400 }
+      )
+    }
+
     const createdRecords = await prisma.$transaction(
-      records.map((record: {
-        dataLancamento: string
-        os: string
-        examesOs?: string
-        descricao: string
-        exame?: string
-        empresa?: string
-        valor: number
-        dataVencimento: string
-      }) =>
+      newRecords.map((record: any) =>
         prisma.record.create({
           data: {
             dataLancamento: new Date(record.dataLancamento),
