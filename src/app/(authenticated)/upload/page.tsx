@@ -5,7 +5,20 @@ import { useRouter } from 'next/navigation'
 import { formatCurrency, formatDate, getExamPrice, addDays } from '@/lib/utils'
 import type { ExtractedOSData, ExtractedRepasseData, RepasseExtractionResult } from '@/types'
 
-type UploadMode = 'OS' | 'REPASSE'
+type UploadMode = 'OS' | 'REPASSE' | 'LOTE'
+
+interface BatchImage {
+  id: string
+  file: File
+  preview: string
+  status: 'queued' | 'processing' | 'success' | 'duplicate' | 'error' | 'unknown_type'
+  type?: 'OS' | 'REPASSE' | 'UNKNOWN'
+  recordsCreated?: number
+  recordsUpdated?: number
+  duplicatesSkipped?: number
+  notFound?: number
+  error?: string
+}
 
 export default function UploadPage() {
   const [mode, setMode] = useState<UploadMode>('OS')
@@ -20,12 +33,113 @@ export default function UploadPage() {
   // Repasse extraction state
   const [repasseData, setRepasseData] = useState<RepasseExtractionResult | null>(null)
 
+  // Batch processing state
+  const [batchImages, setBatchImages] = useState<BatchImage[]>([])
+  const [batchProcessing, setBatchProcessing] = useState(false)
+  const [batchPaused, setBatchPaused] = useState(false)
+  const [batchComplete, setBatchComplete] = useState(false)
+  const batchPausedRef = useRef(false)
+
   // Confirmation state
   const [confirming, setConfirming] = useState(false)
   const [result, setResult] = useState<{ type: string; message: string; details?: string } | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const router = useRouter()
+
+  const handleBatchFileSelect = (files: File[]) => {
+    setError(null)
+    setResult(null)
+
+    const validFiles = files.filter(f => f.size <= 10 * 1024 * 1024)
+    if (validFiles.length < files.length) {
+      setError('Alguns arquivos são muito grandes e foram ignorados. Máximo: 10MB por arquivo.')
+    }
+
+    if (validFiles.length === 0) return
+
+    validFiles.forEach(file => {
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        const base64 = e.target?.result as string
+        setBatchImages(prev => [
+          ...prev, 
+          { 
+            id: crypto.randomUUID(), 
+            file, 
+            preview: base64, 
+            status: 'queued' 
+          }
+        ])
+      }
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const processBatch = async (imagesToProcess?: BatchImage[]) => {
+    const queue = imagesToProcess || batchImages.filter(img => img.status === 'queued')
+    setBatchProcessing(true)
+    setBatchPaused(false)
+    batchPausedRef.current = false
+    setBatchComplete(false)
+
+    for (const image of queue) {
+      if (batchPausedRef.current) break
+
+      setBatchImages(prev => prev.map(img => 
+        img.id === image.id ? { ...img, status: 'processing' as const } : img
+      ))
+
+      try {
+        const response = await fetch('/api/process-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            image: image.preview, 
+            fileName: image.file.name,
+            ...(image.type && image.type !== 'UNKNOWN' ? { tipo: image.type } : {})
+          }),
+        })
+
+        const data = await response.json()
+
+        if (data.success) {
+          setBatchImages(prev => prev.map(img =>
+            img.id === image.id ? {
+              ...img,
+              status: (data.recordsCreated === 0 && data.recordsUpdated === 0) ? 'duplicate' as const : 'success' as const,
+              type: data.type,
+              recordsCreated: data.recordsCreated || 0,
+              recordsUpdated: data.recordsUpdated || 0,
+              duplicatesSkipped: data.duplicatesSkipped || 0,
+              notFound: data.notFound || 0,
+            } : img
+          ))
+        } else if (data.type === 'UNKNOWN') {
+          setBatchImages(prev => prev.map(img =>
+            img.id === image.id ? { ...img, status: 'unknown_type' as const, type: 'UNKNOWN' } : img
+          ))
+        } else {
+          setBatchImages(prev => prev.map(img =>
+            img.id === image.id ? { ...img, status: 'error' as const, error: data.error || 'Erro desconhecido' } : img
+          ))
+        }
+      } catch (err) {
+        setBatchImages(prev => prev.map(img =>
+          img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro de conexão' } : img
+        ))
+      }
+
+      if (!batchPausedRef.current) {
+        await new Promise(resolve => setTimeout(resolve, 5000))
+      }
+    }
+
+    setBatchProcessing(false)
+    if (!batchPausedRef.current) {
+      setBatchComplete(true)
+    }
+  }
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -202,6 +316,11 @@ export default function UploadPage() {
     setRepasseData(null)
     setError(null)
     setResult(null)
+    setBatchImages([])
+    setBatchProcessing(false)
+    setBatchPaused(false)
+    setBatchComplete(false)
+    batchPausedRef.current = false
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -210,17 +329,19 @@ export default function UploadPage() {
       {/* Header */}
       <div>
         <h1 className="text-2xl sm:text-3xl font-bold text-slate-100">
-          {mode === 'OS' ? '📤 Novo Lançamento' : '💳 Confirmar Pagamento'}
+          {mode === 'OS' ? '📤 Novo Lançamento' : mode === 'REPASSE' ? '💳 Confirmar Pagamento' : '📤 Upload em Massa'}
         </h1>
         <p className="text-slate-400 text-sm mt-1">
           {mode === 'OS'
             ? 'Upload da tela do iQuery para lançar novas ordens de serviço'
-            : 'Upload da listagem de repasse para confirmar pagamentos'}
+            : mode === 'REPASSE'
+            ? 'Upload da listagem de repasse para confirmar pagamentos'
+            : 'Envie múltiplas imagens para processamento automático em lote'}
         </p>
       </div>
 
       {/* Mode Selector */}
-      <div className="glass-card p-1 inline-flex rounded-xl">
+      <div className="glass-card p-1 inline-flex rounded-xl flex-wrap">
         <button
           onClick={() => { setMode('OS'); resetAll() }}
           className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
@@ -243,10 +364,21 @@ export default function UploadPage() {
         >
           💳 Confirmar Pagamento
         </button>
+        <button
+          onClick={() => { setMode('LOTE'); resetAll() }}
+          className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+            mode === 'LOTE'
+              ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10'
+              : 'text-slate-400 hover:text-slate-300'
+          }`}
+          id="btn-mode-lote"
+        >
+          📤 Upload em Massa
+        </button>
       </div>
 
       {/* Upload Zone */}
-      {!imagePreview && !result && (
+      {mode !== 'LOTE' && !imagePreview && !result && (
         <div
           className="upload-zone p-8 sm:p-12 text-center"
           onClick={() => fileInputRef.current?.click()}
@@ -290,6 +422,190 @@ export default function UploadPage() {
           <button className="btn btn-primary btn-sm">
             Selecionar Imagem
           </button>
+        </div>
+      )}
+
+      {/* LOTE Upload Zone */}
+      {mode === 'LOTE' && !batchImages.length && !batchComplete && (
+        <div
+          className="upload-zone p-8 sm:p-12 text-center"
+          onClick={() => document.getElementById('batch-file-input')?.click()}
+          onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('dragging') }}
+          onDragLeave={(e) => { e.preventDefault(); e.currentTarget.classList.remove('dragging') }}
+          onDrop={(e) => {
+            e.preventDefault()
+            e.currentTarget.classList.remove('dragging')
+            const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'))
+            if (files.length > 0) {
+              handleBatchFileSelect(files)
+            }
+          }}
+          id="batch-upload-zone"
+        >
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={(e) => {
+               if (e.target.files) handleBatchFileSelect(Array.from(e.target.files))
+               // Reset input value to allow selecting same files again if cleared
+               e.target.value = ''
+            }}
+            className="hidden"
+            id="batch-file-input"
+          />
+          <div className="text-5xl mb-4">
+            📤
+          </div>
+          <p className="text-slate-300 font-medium mb-2">
+            Selecione ou arraste várias imagens
+          </p>
+          <p className="text-slate-500 text-sm mb-4">
+            Envie múltiplas telas para processamento em lote
+          </p>
+          <button className="btn btn-primary btn-sm">
+            Selecionar Imagens
+          </button>
+        </div>
+      )}
+
+      {/* Batch Queue UI */}
+      {mode === 'LOTE' && batchImages.length > 0 && !batchComplete && (
+        <div className="glass-card overflow-hidden animate-slide-up">
+          <div className="p-4 border-b border-slate-700/30 sm:flex items-center justify-between space-y-4 sm:space-y-0">
+            <div>
+              <h2 className="text-lg font-semibold text-slate-200">
+                Lote de Imagens ({batchImages.length})
+              </h2>
+              <div className="flex items-center gap-2 mt-2">
+                <div className="w-48 bg-slate-700/50 rounded-full h-2 overflow-hidden">
+                  <div 
+                    className="bg-teal-500 h-full transition-all duration-300" 
+                    style={{ 
+                      width: `${(batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing').length / batchImages.length) * 100}%` 
+                    }} 
+                  />
+                </div>
+                <span className="text-xs text-slate-400">
+                  {batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing').length} / {batchImages.length}
+                </span>
+              </div>
+            </div>
+            
+            <div className="flex gap-2 flex-wrap">
+              {!batchProcessing && batchImages.some(i => i.status === 'queued') && (
+                <button onClick={() => processBatch()} className="btn btn-primary btn-sm">
+                  ▶️ Iniciar Processamento
+                </button>
+              )}
+              {batchProcessing && !batchPaused && (
+                <button onClick={() => {
+                  batchPausedRef.current = true
+                  setBatchPaused(true)
+                }} className="btn btn-secondary btn-sm">
+                  ⏸️ Pausar
+                </button>
+              )}
+              {batchProcessing && batchPaused && (
+                <button onClick={() => processBatch()} className="btn btn-primary btn-sm">
+                  ▶️ Retomar
+                </button>
+              )}
+              <button onClick={resetAll} className="btn btn-ghost btn-sm text-slate-400 hover:text-rose-400">
+                🗑️ Limpar
+              </button>
+            </div>
+          </div>
+          
+          <div className="p-2 space-y-2 max-h-[60vh] overflow-y-auto">
+            {batchImages.map(img => (
+              <div key={img.id} className="flex items-center gap-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
+                <img src={img.preview} alt={img.file.name} className="w-12 h-12 rounded object-cover" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-slate-200 truncate">{img.file.name}</p>
+                  <div className="text-xs mt-1">
+                    {img.status === 'queued' && <span className="text-slate-400">⏳ Na fila</span>}
+                    {img.status === 'processing' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Processando...</span>}
+                    {img.status === 'success' && <span className="text-emerald-400">✅ {img.type} - {img.type === 'OS' ? `${img.recordsCreated} salvos` : `${img.recordsUpdated} atualizados`}</span>}
+                    {img.status === 'duplicate' && <span className="text-amber-400">⚠️ Duplicatas ignoradas ({img.duplicatesSkipped})</span>}
+                    {img.status === 'error' && <span className="text-rose-400">❌ {img.error}</span>}
+                    {img.status === 'unknown_type' && (
+                      <div className="flex items-center gap-2 flex-wrap mt-1">
+                        <span className="text-amber-400">❓ Tipo não reconhecido</span>
+                        <button onClick={() => {
+                          setBatchImages(prev => prev.map(i => i.id === img.id ? { ...i, type: 'OS', status: 'queued' } : i))
+                          processBatch([{ ...img, type: 'OS', status: 'queued' }])
+                        }} className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 hover:bg-teal-500/20 hover:text-teal-400 transition-colors">📋 OS</button>
+                        <button onClick={() => {
+                          setBatchImages(prev => prev.map(i => i.id === img.id ? { ...i, type: 'REPASSE', status: 'queued' } : i))
+                          processBatch([{ ...img, type: 'REPASSE', status: 'queued' }])
+                        }} className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 hover:bg-teal-500/20 hover:text-teal-400 transition-colors">💳 Repasse</button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Batch Summary */}
+      {mode === 'LOTE' && batchComplete && (
+        <div className="glass-card p-6 animate-slide-up border-teal-500/30 bg-teal-500/5">
+          <div className="text-center mb-6">
+            <h2 className="text-2xl font-bold text-slate-100">Lote Concluído! 🎉</h2>
+            <p className="text-slate-400 mt-1">Veja o resumo do processamento abaixo</p>
+          </div>
+          
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-6">
+            <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700/30 text-center">
+              <div className="text-3xl font-bold text-slate-200">{batchImages.length}</div>
+              <div className="text-xs text-slate-400 mt-1 uppercase tracking-wider">Imagens</div>
+            </div>
+            <div className="bg-emerald-500/10 p-4 rounded-xl border border-emerald-500/20 text-center">
+              <div className="text-3xl font-bold text-emerald-400">
+                {batchImages.reduce((acc, img) => acc + (img.recordsCreated || 0), 0)}
+              </div>
+              <div className="text-xs text-emerald-500/70 mt-1 uppercase tracking-wider">OS Criadas</div>
+            </div>
+            <div className="bg-emerald-500/10 p-4 rounded-xl border border-emerald-500/20 text-center">
+              <div className="text-3xl font-bold text-emerald-400">
+                {batchImages.reduce((acc, img) => acc + (img.recordsUpdated || 0), 0)}
+              </div>
+              <div className="text-xs text-emerald-500/70 mt-1 uppercase tracking-wider">Repasses Atualizados</div>
+            </div>
+            <div className="bg-amber-500/10 p-4 rounded-xl border border-amber-500/20 text-center">
+              <div className="text-3xl font-bold text-amber-400">
+                {batchImages.reduce((acc, img) => acc + (img.duplicatesSkipped || 0), 0)}
+              </div>
+              <div className="text-xs text-amber-500/70 mt-1 uppercase tracking-wider">Duplicadas</div>
+            </div>
+            <div className="bg-rose-500/10 p-4 rounded-xl border border-rose-500/20 text-center">
+              <div className="text-3xl font-bold text-rose-400">
+                {batchImages.filter(img => img.status === 'error' || img.status === 'unknown_type').length}
+              </div>
+              <div className="text-xs text-rose-500/70 mt-1 uppercase tracking-wider">Erros/Pendentes</div>
+            </div>
+          </div>
+          
+          <div className="flex justify-center gap-3 flex-wrap">
+            {batchImages.some(img => img.status === 'error') && (
+              <button onClick={() => {
+                const retryImages = batchImages.filter(img => img.status === 'error').map(img => ({ ...img, status: 'queued' as const, error: undefined }))
+                setBatchImages(prev => prev.map(img => img.status === 'error' ? { ...img, status: 'queued', error: undefined } : img))
+                processBatch(retryImages)
+              }} className="btn btn-secondary">
+                🔄 Reprocessar Falhas
+              </button>
+            )}
+            <button onClick={resetAll} className="btn btn-secondary">
+              Novo Lote
+            </button>
+            <button onClick={() => router.push('/dashboard')} className="btn btn-primary">
+              Ver Dashboard
+            </button>
+          </div>
         </div>
       )}
 

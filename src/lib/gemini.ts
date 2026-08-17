@@ -143,3 +143,36 @@ export async function extractRepasseData(base64Image: string): Promise<RepasseEx
     throw new Error('Erro ao processar dados da imagem pela IA')
   }
 }
+
+export async function classifyImageType(base64Image: string): Promise<'OS' | 'REPASSE' | 'UNKNOWN'> {
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' })
+
+  const matches = base64Image.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/)
+  if (!matches || matches.length !== 3) {
+    throw new Error('Formato de imagem inválido')
+  }
+
+  const mimeType = matches[1]
+  const base64Data = matches[2]
+
+  const prompt = `Analise esta imagem e determine o tipo de documento.
+Se for uma "Listagem de OS" (Ordens de Serviço), com colunas como Id, Exames OS, Paciente, Empresa, Executante, responda: OS
+Se for uma "Listagem de Repasses" financeiros, com colunas como OS, Paciente, Bruto, Desc, Líquido, Total Relatório, responda: REPASSE
+Se não for nenhum dos dois tipos, responda: UNKNOWN
+
+Responda APENAS com uma das três palavras: OS, REPASSE ou UNKNOWN. Nada mais.`
+
+  const imagePart = {
+    inlineData: {
+      data: base64Data,
+      mimeType
+    }
+  }
+
+  const result = await model.generateContent([prompt, imagePart])
+  const text = result.response.text().trim().toUpperCase()
+
+  if (text === 'OS') return 'OS'
+  if (text === 'REPASSE') return 'REPASSE'
+  return 'UNKNOWN'
+}
