@@ -43,6 +43,7 @@ export default function UploadPage() {
   // Confirmation state
   const [confirming, setConfirming] = useState(false)
   const [result, setResult] = useState<{ type: string; message: string; details?: string } | null>(null)
+  const [zoomedImage, setZoomedImage] = useState<string | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const router = useRouter()
@@ -586,11 +587,16 @@ export default function UploadPage() {
           <div className="p-2 space-y-2 max-h-[60vh] overflow-y-auto">
             {batchImages.map(img => (
               <div key={img.id} className="flex items-center gap-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
-                <img src={img.preview} alt={img.file.name} className="w-12 h-12 rounded object-cover" />
+                <img 
+                  src={img.preview} 
+                  alt={img.file.name} 
+                  className="w-12 h-12 rounded object-cover cursor-pointer hover:opacity-80 transition-opacity" 
+                  onClick={() => setZoomedImage(img.preview)}
+                />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-slate-200 truncate">{img.file.name}</p>
                   <div className="text-xs mt-1">
-                    {img.status === 'queued' && <span className="text-slate-400">⏳ Na fila</span>}
+                    {img.status === 'queued' && <span className="text-slate-400">⏳ Na fila {img.type && img.type !== 'UNKNOWN' && <span className="text-teal-400 ml-1 font-medium">[{img.type}]</span>}</span>}
                     {img.status === 'classifying' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Analisando tipo...</span>}
                     {img.status === 'processing' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Processando...</span>}
                     {img.status === 'success' && <span className="text-emerald-400">✅ {img.type} - {img.type === 'OS' ? `${img.recordsCreated} salvos` : `${img.recordsUpdated} atualizados`}</span>}
@@ -952,6 +958,27 @@ export default function UploadPage() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Zoomed Image Modal */}
+      {zoomedImage && (
+        <div 
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 p-4 animate-fade-in"
+          onClick={() => setZoomedImage(null)}
+        >
+          <button 
+            className="absolute top-4 right-4 text-white hover:text-rose-400 text-4xl w-12 h-12 flex items-center justify-center bg-slate-900/50 rounded-full"
+            onClick={() => setZoomedImage(null)}
+          >
+            &times;
+          </button>
+          <img 
+            src={zoomedImage} 
+            alt="Preview Ampliado" 
+            className="max-w-full max-h-[90vh] object-contain rounded-lg shadow-2xl" 
+            onClick={(e) => e.stopPropagation()}
+          />
         </div>
       )}
     </div>

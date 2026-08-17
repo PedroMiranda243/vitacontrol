@@ -156,11 +156,11 @@ export async function classifyImageType(base64Image: string): Promise<'OS' | 'RE
   const base64Data = matches[2]
 
   const prompt = `Analise esta imagem e determine o tipo de documento.
-Se for uma "Listagem de OS" (Ordens de Serviço), com colunas como Id, Exames OS, Paciente, Empresa, Executante, responda: OS
-Se for uma "Listagem de Repasses" financeiros, com colunas como OS, Paciente, Bruto, Desc, Líquido, Total Relatório, responda: REPASSE
-Se não for nenhum dos dois tipos, responda: UNKNOWN
+Se a imagem contiver termos como "Listagem de OS", "Ordem de Serviço", "Exames OS", ou focar em "Paciente" e "Laudo", trata-se de uma OS.
+Se a imagem contiver termos como "Listagem de Repasses", "Sintético", "Analítico", "Bruto", "Desc", "Líquido", ou "Total Relatório", trata-se de um REPASSE.
+Se a imagem estiver cortada ou um pouco ilegível, tente deduzir pelo contexto (tabela com valores financeiros e descontos costuma ser REPASSE, tabela com nomes de exames e executantes costuma ser OS).
 
-Responda APENAS com uma das três palavras: OS, REPASSE ou UNKNOWN. Nada mais.`
+Responda APENAS com a palavra OS ou a palavra REPASSE. Se tiver absoluta certeza que não é uma tabela do sistema, responda UNKNOWN.`
 
   const imagePart = {
     inlineData: {
@@ -172,7 +172,7 @@ Responda APENAS com uma das três palavras: OS, REPASSE ou UNKNOWN. Nada mais.`
   const result = await model.generateContent([prompt, imagePart])
   const text = result.response.text().trim().toUpperCase()
 
-  if (text === 'OS') return 'OS'
-  if (text === 'REPASSE') return 'REPASSE'
+  if (text.includes('REPASSE')) return 'REPASSE'
+  if (text.includes('OS')) return 'OS'
   return 'UNKNOWN'
 }
