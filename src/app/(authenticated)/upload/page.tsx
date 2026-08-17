@@ -123,6 +123,9 @@ export default function UploadPage() {
             status: newType === 'UNKNOWN' ? 'unknown_type' as const : 'queued' as const 
           } : img
         )
+
+        // Delay na classificação para não estourar o limite de 15 RPM
+        await new Promise(r => setTimeout(r, 4500))
       } catch (err) {
         setBatchImages(prev => prev.map(img =>
           img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro na classificação' } : img
@@ -132,6 +135,15 @@ export default function UploadPage() {
     }
 
     if (batchPausedRef.current) {
+      setBatchProcessing(false)
+      return
+    }
+
+    // FASE 1.5: Pausa obrigatória se tiver pendências
+    const hasPendingClassification = currentQueue.some(img => img.status === 'unknown_type' || img.status === 'error')
+    if (hasPendingClassification) {
+      setBatchPaused(true)
+      batchPausedRef.current = true
       setBatchProcessing(false)
       return
     }
@@ -544,6 +556,11 @@ export default function UploadPage() {
             <div>
               <h2 className="text-lg font-semibold text-slate-200">
                 Lote de Imagens ({batchImages.length})
+                {batchPaused && batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') && (
+                  <span className="ml-3 text-amber-400 text-sm animate-pulse">
+                    ⚠️ Pausado: Classifique as pendentes
+                  </span>
+                )}
               </h2>
               <div className="flex items-center gap-2 mt-2">
                 <div className="w-48 bg-slate-700/50 rounded-full h-2 overflow-hidden">
@@ -573,8 +590,12 @@ export default function UploadPage() {
                   ⏸️ Pausar
                 </button>
               )}
-              {batchProcessing && batchPaused && (
-                <button onClick={() => processBatch()} className="btn btn-primary btn-sm">
+              {batchPaused && (
+                <button onClick={() => {
+                  setBatchPaused(false)
+                  batchPausedRef.current = false
+                  processBatch()
+                }} className="btn btn-primary btn-sm animate-pulse">
                   ▶️ Retomar
                 </button>
               )}
@@ -607,11 +628,9 @@ export default function UploadPage() {
                         <span className="text-amber-400">❓ Tipo não reconhecido</span>
                         <button onClick={() => {
                           setBatchImages(prev => prev.map(i => i.id === img.id ? { ...i, type: 'OS', status: 'queued' } : i))
-                          processBatch([{ ...img, type: 'OS', status: 'queued' }])
                         }} className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 hover:bg-teal-500/20 hover:text-teal-400 transition-colors">📋 OS</button>
                         <button onClick={() => {
                           setBatchImages(prev => prev.map(i => i.id === img.id ? { ...i, type: 'REPASSE', status: 'queued' } : i))
-                          processBatch([{ ...img, type: 'REPASSE', status: 'queued' }])
                         }} className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 hover:bg-teal-500/20 hover:text-teal-400 transition-colors">💳 Repasse</button>
                       </div>
                     )}
