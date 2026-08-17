@@ -11,7 +11,7 @@ interface BatchImage {
   id: string
   file: File
   preview: string
-  status: 'queued' | 'processing' | 'success' | 'duplicate' | 'error' | 'unknown_type'
+  status: 'queued' | 'classifying' | 'processing' | 'success' | 'duplicate' | 'error' | 'unknown_type'
   type?: 'OS' | 'REPASSE' | 'UNKNOWN'
   recordsCreated?: number
   recordsUpdated?: number
@@ -77,13 +77,84 @@ export default function UploadPage() {
   }
 
   const processBatch = async (imagesToProcess?: BatchImage[]) => {
-    const queue = imagesToProcess || batchImages.filter(img => img.status === 'queued')
     setBatchProcessing(true)
     setBatchPaused(false)
     batchPausedRef.current = false
     setBatchComplete(false)
 
-    for (const image of queue) {
+    let currentQueue = imagesToProcess || batchImages.filter(img => img.status === 'queued')
+    
+    if (currentQueue.length === 0) {
+      setBatchProcessing(false)
+      return
+    }
+
+    // FASE 1: Classificação
+    const unclassified = currentQueue.filter(img => !img.type || img.type === 'UNKNOWN')
+    for (const image of unclassified) {
+      if (batchPausedRef.current) break
+
+      setBatchImages(prev => prev.map(img => 
+        img.id === image.id ? { ...img, status: 'classifying' as const } : img
+      ))
+
+      try {
+        const response = await fetch('/api/classify-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: image.preview }),
+        })
+        const data = await response.json()
+        const newType = data.success ? data.type : 'UNKNOWN'
+
+        setBatchImages(prev => prev.map(img =>
+          img.id === image.id ? {
+            ...img,
+            status: newType === 'UNKNOWN' ? 'unknown_type' as const : 'queued' as const,
+            type: newType
+          } : img
+        ))
+        
+        currentQueue = currentQueue.map(img => 
+          img.id === image.id ? { 
+            ...img, 
+            type: newType, 
+            status: newType === 'UNKNOWN' ? 'unknown_type' as const : 'queued' as const 
+          } : img
+        )
+      } catch (err) {
+        setBatchImages(prev => prev.map(img =>
+          img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro na classificação' } : img
+        ))
+        currentQueue = currentQueue.map(img => img.id === image.id ? { ...img, status: 'error' as const } : img)
+      }
+    }
+
+    if (batchPausedRef.current) {
+      setBatchProcessing(false)
+      return
+    }
+
+    // FASE 2: Ordenação (OS primeiro)
+    setBatchImages(prev => {
+      return [...prev].sort((a, b) => {
+        if (a.type === 'OS' && b.type !== 'OS') return -1
+        if (a.type !== 'OS' && b.type === 'OS') return 1
+        return 0
+      })
+    })
+
+    const toProcess = currentQueue
+      .filter(img => img.status === 'queued')
+      .filter(img => img.type !== 'UNKNOWN')
+      .sort((a, b) => {
+        if (a.type === 'OS' && b.type !== 'OS') return -1
+        if (a.type !== 'OS' && b.type === 'OS') return 1
+        return 0
+      })
+
+    // FASE 3: Processamento
+    for (const image of toProcess) {
       if (batchPausedRef.current) break
 
       setBatchImages(prev => prev.map(img => 
@@ -97,7 +168,7 @@ export default function UploadPage() {
           body: JSON.stringify({ 
             image: image.preview, 
             fileName: image.file.name,
-            ...(image.type && image.type !== 'UNKNOWN' ? { tipo: image.type } : {})
+            tipo: image.type
           }),
         })
 
@@ -114,10 +185,6 @@ export default function UploadPage() {
               duplicatesSkipped: data.duplicatesSkipped || 0,
               notFound: data.notFound || 0,
             } : img
-          ))
-        } else if (data.type === 'UNKNOWN') {
-          setBatchImages(prev => prev.map(img =>
-            img.id === image.id ? { ...img, status: 'unknown_type' as const, type: 'UNKNOWN' } : img
           ))
         } else {
           setBatchImages(prev => prev.map(img =>
@@ -479,15 +546,14 @@ export default function UploadPage() {
               </h2>
               <div className="flex items-center gap-2 mt-2">
                 <div className="w-48 bg-slate-700/50 rounded-full h-2 overflow-hidden">
-                  <div 
-                    className="bg-teal-500 h-full transition-all duration-300" 
-                    style={{ 
-                      width: `${(batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing').length / batchImages.length) * 100}%` 
-                    }} 
-                  />
+                  <div className="h-full bg-teal-500 rounded-full transition-all duration-500 ease-out" 
+                      style={{ 
+                      width: `${(batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing' && i.status !== 'classifying').length / batchImages.length) * 100}%` 
+                      }} 
+                    />
                 </div>
                 <span className="text-xs text-slate-400">
-                  {batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing').length} / {batchImages.length}
+                  {batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing' && i.status !== 'classifying').length} / {batchImages.length}
                 </span>
               </div>
             </div>
@@ -525,6 +591,7 @@ export default function UploadPage() {
                   <p className="text-sm font-medium text-slate-200 truncate">{img.file.name}</p>
                   <div className="text-xs mt-1">
                     {img.status === 'queued' && <span className="text-slate-400">⏳ Na fila</span>}
+                    {img.status === 'classifying' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Analisando tipo...</span>}
                     {img.status === 'processing' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Processando...</span>}
                     {img.status === 'success' && <span className="text-emerald-400">✅ {img.type} - {img.type === 'OS' ? `${img.recordsCreated} salvos` : `${img.recordsUpdated} atualizados`}</span>}
                     {img.status === 'duplicate' && <span className="text-amber-400">⚠️ Duplicatas ignoradas ({img.duplicatesSkipped})</span>}
