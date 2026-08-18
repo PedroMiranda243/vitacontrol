@@ -39,6 +39,7 @@ export default function UploadPage() {
   const [batchPaused, setBatchPaused] = useState(false)
   const [batchComplete, setBatchComplete] = useState(false)
   const batchPausedRef = useRef(false)
+  const batchRunIdRef = useRef(0)
   const [activeClassifyIndex, setActiveClassifyIndex] = useState(-1)
 
   // Confirmation state
@@ -87,6 +88,9 @@ export default function UploadPage() {
     setBatchPaused(false)
     batchPausedRef.current = false
     setBatchComplete(false)
+    
+    batchRunIdRef.current += 1
+    const currentRunId = batchRunIdRef.current
 
     let currentQueue = imagesToProcess || batchImages.filter(img => img.status === 'queued')
     
@@ -115,56 +119,75 @@ export default function UploadPage() {
 
     // FASE 3: Processamento
     for (const image of toProcess) {
-      if (batchPausedRef.current) break
+      if (batchPausedRef.current || batchRunIdRef.current !== currentRunId) break
 
       setBatchImages(prev => prev.map(img => 
         img.id === image.id ? { ...img, status: 'processing' as const } : img
       ))
 
-      try {
-        const response = await fetch('/api/process-image', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            image: image.preview, 
-            fileName: image.file.name,
-            tipo: image.type
-          }),
-        })
+      let success = false
+      let retries = 0
 
-        const data = await response.json()
+      while (!success && retries < 3) {
+        if (batchPausedRef.current || batchRunIdRef.current !== currentRunId) break
 
-        if (data.success) {
+        try {
+          const response = await fetch('/api/process-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              image: image.preview, 
+              fileName: image.file.name,
+              tipo: image.type
+            }),
+          })
+
+          if (response.status === 429) {
+            retries++
+            if (retries < 3) {
+              await new Promise(resolve => setTimeout(resolve, 10000)) // Wait 10s on Rate Limit
+              continue
+            }
+          }
+
+          const data = await response.json()
+          success = true
+
+          if (data.success) {
+            setBatchImages(prev => prev.map(img =>
+              img.id === image.id ? {
+                ...img,
+                status: (data.recordsCreated === 0 && data.recordsUpdated === 0) ? 'duplicate' as const : 'success' as const,
+                type: data.type,
+                recordsCreated: data.recordsCreated || 0,
+                recordsUpdated: data.recordsUpdated || 0,
+                duplicatesSkipped: data.duplicatesSkipped || 0,
+                notFound: data.notFound || 0,
+              } : img
+            ))
+          } else {
+            setBatchImages(prev => prev.map(img =>
+              img.id === image.id ? { ...img, status: 'error' as const, error: data.error || 'Erro desconhecido' } : img
+            ))
+          }
+        } catch (err) {
+          success = true // break out of retry loop on network error
           setBatchImages(prev => prev.map(img =>
-            img.id === image.id ? {
-              ...img,
-              status: (data.recordsCreated === 0 && data.recordsUpdated === 0) ? 'duplicate' as const : 'success' as const,
-              type: data.type,
-              recordsCreated: data.recordsCreated || 0,
-              recordsUpdated: data.recordsUpdated || 0,
-              duplicatesSkipped: data.duplicatesSkipped || 0,
-              notFound: data.notFound || 0,
-            } : img
-          ))
-        } else {
-          setBatchImages(prev => prev.map(img =>
-            img.id === image.id ? { ...img, status: 'error' as const, error: data.error || 'Erro desconhecido' } : img
+            img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro de conexão' } : img
           ))
         }
-      } catch (err) {
-        setBatchImages(prev => prev.map(img =>
-          img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro de conexão' } : img
-        ))
       }
 
-      if (!batchPausedRef.current) {
+      if (!batchPausedRef.current && batchRunIdRef.current === currentRunId) {
         await new Promise(resolve => setTimeout(resolve, 6500))
       }
     }
 
-    setBatchProcessing(false)
-    if (!batchPausedRef.current) {
-      setBatchComplete(true)
+    if (batchRunIdRef.current === currentRunId) {
+      setBatchProcessing(false)
+      if (!batchPausedRef.current) {
+        setBatchComplete(true)
+      }
     }
   }
 
@@ -348,6 +371,7 @@ export default function UploadPage() {
     setBatchPaused(false)
     setBatchComplete(false)
     batchPausedRef.current = false
+    batchRunIdRef.current += 1
     setActiveClassifyIndex(-1)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
