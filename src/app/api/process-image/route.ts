@@ -24,9 +24,9 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    let resolvedType = tipo
+    const resolvedType = tipo
     if (!resolvedType) {
-      resolvedType = await classifyImageType(image)
+      return NextResponse.json({ success: false, type: 'UNKNOWN', error: 'Tipo não especificado' }, { status: 400 })
     }
 
     if (resolvedType === 'UNKNOWN') {
