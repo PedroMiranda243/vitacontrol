@@ -125,7 +125,7 @@ export default function UploadPage() {
         )
 
         // Delay na classificação para não estourar o limite de 15 RPM
-        await new Promise(r => setTimeout(r, 4500))
+        await new Promise(r => setTimeout(r, 6500))
       } catch (err) {
         setBatchImages(prev => prev.map(img =>
           img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro na classificação' } : img
@@ -211,7 +211,7 @@ export default function UploadPage() {
       }
 
       if (!batchPausedRef.current) {
-        await new Promise(resolve => setTimeout(resolve, 5000))
+        await new Promise(resolve => setTimeout(resolve, 6500))
       }
     }
 
