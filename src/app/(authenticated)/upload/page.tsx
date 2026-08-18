@@ -145,12 +145,21 @@ export default function UploadPage() {
           if (response.status === 429) {
             retries++
             if (retries < 3) {
-              await new Promise(resolve => setTimeout(resolve, 10000)) // Wait 10s on Rate Limit
+              await new Promise(resolve => setTimeout(resolve, 15000)) // Wait 15s on Rate Limit
               continue
             }
           }
 
           const data = await response.json()
+
+          if (!data.success && data.error && (data.error.includes('429') || data.error.includes('Quota exceeded'))) {
+            retries++
+            if (retries < 3) {
+              await new Promise(resolve => setTimeout(resolve, 15000)) // Wait 15s on Rate Limit
+              continue
+            }
+          }
+
           success = true
 
           if (data.success) {

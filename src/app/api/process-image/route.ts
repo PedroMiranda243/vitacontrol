@@ -160,6 +160,9 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error('Process image error:', error)
     const message = error instanceof Error ? error.message : 'Erro ao processar imagem'
+    if (message.includes('429') || message.includes('Quota exceeded')) {
+      return NextResponse.json({ success: false, error: message }, { status: 429 })
+    }
     return NextResponse.json({ success: false, error: message }, { status: 500 })
   }
 }
