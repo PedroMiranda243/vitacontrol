@@ -89,8 +89,31 @@ export async function extractOSData(base64Image: string): Promise<ExtractedOSDat
     }
   }
 
-  const result = await model.generateContent([prompt, imagePart])
-  const text = result.response.text()
+  let text = ''
+  let retryCount = 0
+  const maxRetries = 3
+  const delays = [10000, 20000, 40000]
+
+  while (true) {
+    try {
+      const result = await model.generateContent([prompt, imagePart])
+      text = result.response.text()
+      break
+    } catch (error: any) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      if (errorMessage.includes('429') && (errorMessage.includes('PerDayPerProject') || errorMessage.includes('per day'))) {
+        throw new Error('QUOTA_DAILY_EXCEEDED: ' + errorMessage)
+      }
+      if (errorMessage.includes('429') && (errorMessage.includes('retryDelay') || errorMessage.includes('retry in'))) {
+        if (retryCount < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, delays[retryCount]))
+          retryCount++
+          continue
+        }
+      }
+      throw error
+    }
+  }
 
   try {
     // Remove markdowns if Gemini adds them despite instruct
@@ -127,8 +150,31 @@ export async function extractRepasseData(base64Image: string): Promise<RepasseEx
     }
   }
 
-  const result = await model.generateContent([prompt, imagePart])
-  const text = result.response.text()
+  let text = ''
+  let retryCount = 0
+  const maxRetries = 3
+  const delays = [10000, 20000, 40000]
+
+  while (true) {
+    try {
+      const result = await model.generateContent([prompt, imagePart])
+      text = result.response.text()
+      break
+    } catch (error: any) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      if (errorMessage.includes('429') && (errorMessage.includes('PerDayPerProject') || errorMessage.includes('per day'))) {
+        throw new Error('QUOTA_DAILY_EXCEEDED: ' + errorMessage)
+      }
+      if (errorMessage.includes('429') && (errorMessage.includes('retryDelay') || errorMessage.includes('retry in'))) {
+        if (retryCount < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, delays[retryCount]))
+          retryCount++
+          continue
+        }
+      }
+      throw error
+    }
+  }
 
   try {
     let cleanText = text.trim()

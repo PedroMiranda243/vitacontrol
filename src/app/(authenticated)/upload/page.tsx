@@ -6,13 +6,14 @@ import { formatCurrency, formatDate, getExamPrice, addDays } from '@/lib/utils'
 import type { ExtractedOSData, ExtractedRepasseData, RepasseExtractionResult } from '@/types'
 
 type UploadMode = 'OS' | 'REPASSE' | 'LOTE'
+type BatchPhase = 'upload' | 'classify' | 'review' | 'processing' | 'done'
 
 interface BatchImage {
   id: string
   file: File
   preview: string
-  status: 'queued' | 'classifying' | 'processing' | 'success' | 'duplicate' | 'error' | 'unknown_type'
-  type?: 'OS' | 'REPASSE' | 'UNKNOWN'
+  status: 'queued' | 'processing' | 'success' | 'duplicate' | 'error' | 'quota_exceeded'
+  type?: 'OS' | 'REPASSE'
   recordsCreated?: number
   recordsUpdated?: number
   duplicatesSkipped?: number
@@ -33,14 +34,12 @@ export default function UploadPage() {
   // Repasse extraction state
   const [repasseData, setRepasseData] = useState<RepasseExtractionResult | null>(null)
 
-  // Batch processing state
+  // Batch processing state — clean 4-phase machine
   const [batchImages, setBatchImages] = useState<BatchImage[]>([])
-  const [batchProcessing, setBatchProcessing] = useState(false)
-  const [batchPaused, setBatchPaused] = useState(false)
-  const [batchComplete, setBatchComplete] = useState(false)
-  const batchPausedRef = useRef(false)
+  const [batchPhase, setBatchPhase] = useState<BatchPhase>('upload')
+  const [activeClassifyIndex, setActiveClassifyIndex] = useState(0)
   const batchRunIdRef = useRef(0)
-  const [activeClassifyIndex, setActiveClassifyIndex] = useState(-1)
+  const batchAbortRef = useRef(false)
 
   // Confirmation state
   const [confirming, setConfirming] = useState(false)
@@ -50,6 +49,7 @@ export default function UploadPage() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const router = useRouter()
 
+  // ─── BATCH: Phase 1 — Upload ──────────────────────────────────────
   const handleBatchFileSelect = (files: File[]) => {
     setError(null)
     setResult(null)
@@ -75,92 +75,111 @@ export default function UploadPage() {
         reader.readAsDataURL(file)
       })
     })).then(images => {
-      setBatchImages(prev => {
-        const newBatch = [...prev, ...images]
-        if (prev.length === 0) setActiveClassifyIndex(0)
-        return newBatch
-      })
+      setBatchImages(prev => [...prev, ...images])
+      setActiveClassifyIndex(0)
+      setBatchPhase('classify')
     })
   }
 
-  const processBatch = async (imagesToProcess?: BatchImage[]) => {
-    setBatchProcessing(true)
-    setBatchPaused(false)
-    batchPausedRef.current = false
-    setBatchComplete(false)
-    
+  // ─── BATCH: Phase 2 — Classification helpers ─────────────────────
+  const classifyCurrentImage = (type: 'OS' | 'REPASSE') => {
+    setBatchImages(prev => prev.map((img, idx) =>
+      idx === activeClassifyIndex ? { ...img, type } : img
+    ))
+
+    const nextIndex = activeClassifyIndex + 1
+    if (nextIndex >= batchImages.length) {
+      setBatchPhase('review')
+    } else {
+      setActiveClassifyIndex(nextIndex)
+    }
+  }
+
+  const goBackClassification = () => {
+    if (activeClassifyIndex > 0) {
+      setActiveClassifyIndex(activeClassifyIndex - 1)
+    }
+  }
+
+  // ─── BATCH: Phase 4 — Processing ─────────────────────────────────
+  const startProcessing = async () => {
+    setBatchPhase('processing')
+    batchAbortRef.current = false
     batchRunIdRef.current += 1
     const currentRunId = batchRunIdRef.current
 
-    let currentQueue = imagesToProcess || batchImages.filter(img => img.status === 'queued')
-    
-    if (currentQueue.length === 0) {
-      setBatchProcessing(false)
-      return
-    }
-
-    // FASE 2: Ordenação (OS primeiro)
-    setBatchImages(prev => {
-      return [...prev].sort((a, b) => {
-        if (a.type === 'OS' && b.type !== 'OS') return -1
-        if (a.type !== 'OS' && b.type === 'OS') return 1
-        return 0
-      })
+    const sorted = [...batchImages].sort((a, b) => {
+      if (a.type === 'OS' && b.type !== 'OS') return -1
+      if (a.type !== 'OS' && b.type === 'OS') return 1
+      return 0
     })
+    setBatchImages(sorted)
 
-    const toProcess = currentQueue
-      .filter(img => img.status === 'queued')
-      .filter(img => img.type !== 'UNKNOWN')
-      .sort((a, b) => {
-        if (a.type === 'OS' && b.type !== 'OS') return -1
-        if (a.type !== 'OS' && b.type === 'OS') return 1
-        return 0
-      })
+    const toProcess = sorted.filter(img => img.status === 'queued')
 
-    // FASE 3: Processamento
     for (const image of toProcess) {
-      if (batchPausedRef.current || batchRunIdRef.current !== currentRunId) break
+      if (batchAbortRef.current || batchRunIdRef.current !== currentRunId) break
 
-      setBatchImages(prev => prev.map(img => 
+      setBatchImages(prev => prev.map(img =>
         img.id === image.id ? { ...img, status: 'processing' as const } : img
       ))
 
-      let success = false
+      let processed = false
       let retries = 0
 
-      while (!success && retries < 3) {
-        if (batchPausedRef.current || batchRunIdRef.current !== currentRunId) break
+      while (!processed && retries < 3) {
+        if (batchAbortRef.current || batchRunIdRef.current !== currentRunId) break
 
         try {
           const response = await fetch('/api/process-image', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              image: image.preview, 
+            body: JSON.stringify({
+              image: image.preview,
               fileName: image.file.name,
               tipo: image.type
             }),
           })
 
-          if (response.status === 429) {
-            retries++
-            if (retries < 3) {
-              await new Promise(resolve => setTimeout(resolve, 15000)) // Wait 15s on Rate Limit
-              continue
-            }
-          }
-
           const data = await response.json()
 
-          if (!data.success && data.error && (data.error.includes('429') || data.error.includes('Quota exceeded'))) {
+          if (response.status === 429 && data.quotaType === 'rpm') {
             retries++
             if (retries < 3) {
-              await new Promise(resolve => setTimeout(resolve, 15000)) // Wait 15s on Rate Limit
+              const waitTime = 15000 * retries
+              await new Promise(resolve => setTimeout(resolve, waitTime))
               continue
             }
           }
 
-          success = true
+          if (response.status === 429 && data.quotaType === 'daily') {
+            setBatchImages(prev => prev.map(img =>
+              img.status === 'queued' || img.id === image.id
+                ? { ...img, status: 'quota_exceeded' as const, error: 'Cota diária do Gemini atingida' }
+                : img
+            ))
+            setBatchPhase('done')
+            return
+          }
+
+          if (!data.success && data.error && (data.error.includes('429') || data.error.includes('Quota exceeded') || data.error.includes('QUOTA_DAILY_EXCEEDED'))) {
+            if (data.error.includes('QUOTA_DAILY_EXCEEDED') || data.error.includes('PerDayPerProject')) {
+              setBatchImages(prev => prev.map(img =>
+                img.status === 'queued' || img.id === image.id
+                  ? { ...img, status: 'quota_exceeded' as const, error: 'Cota diária do Gemini atingida' }
+                  : img
+              ))
+              setBatchPhase('done')
+              return
+            }
+            retries++
+            if (retries < 3) {
+              await new Promise(resolve => setTimeout(resolve, 15000 * retries))
+              continue
+            }
+          }
+
+          processed = true
 
           if (data.success) {
             setBatchImages(prev => prev.map(img =>
@@ -180,41 +199,45 @@ export default function UploadPage() {
             ))
           }
         } catch (err) {
-          success = true // break out of retry loop on network error
+          processed = true
           setBatchImages(prev => prev.map(img =>
             img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro de conexão' } : img
           ))
         }
       }
 
-      if (!batchPausedRef.current && batchRunIdRef.current === currentRunId) {
+      if (!batchAbortRef.current && batchRunIdRef.current === currentRunId) {
         await new Promise(resolve => setTimeout(resolve, 6500))
       }
     }
 
     if (batchRunIdRef.current === currentRunId) {
-      setBatchProcessing(false)
-      if (!batchPausedRef.current) {
-        setBatchComplete(true)
-      }
+      setBatchPhase('done')
     }
   }
 
+  const retryFailed = () => {
+    setBatchImages(prev => prev.map(img =>
+      img.status === 'error' || img.status === 'quota_exceeded'
+        ? { ...img, status: 'queued' as const, error: undefined }
+        : img
+    ))
+    startProcessing()
+  }
+
+  // ─── Individual upload handlers (unchanged) ───────────────────────
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-
     setError(null)
     setResult(null)
     setOsData([])
     setOsEdits({})
     setRepasseData(null)
-
     if (file.size > 10 * 1024 * 1024) {
       setError('Arquivo muito grande. Máximo: 10MB')
       return
     }
-
     const reader = new FileReader()
     reader.onload = (e) => {
       const base64 = e.target?.result as string
@@ -225,24 +248,19 @@ export default function UploadPage() {
 
   const handleExtract = async () => {
     if (!imagePreview) return
-
     setExtracting(true)
     setError(null)
-
     try {
       const response = await fetch('/api/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: imagePreview, tipo: mode }),
       })
-
       const data = await response.json()
-
       if (!response.ok || !data.success) {
         setError(data.error || 'Erro ao extrair dados da imagem')
         return
       }
-
       if (mode === 'OS') {
         const extracted = data.data as ExtractedOSData[]
         setOsData(Array.isArray(extracted) ? extracted : [])
@@ -271,14 +289,11 @@ export default function UploadPage() {
   const handleConfirmOS = async () => {
     setConfirming(true)
     setError(null)
-
     try {
       const records = osData.map((item, idx) => {
         const edited = osEdits[idx] || {}
         const exame = (edited.exame as string) || item.exame || 'AUDIOMETRIA TONAL'
         const dataLaudoStr = (edited.dataLaudo as string) || item.dataLaudo
-        
-        // Parse date
         let dataLaudo: Date
         if (dataLaudoStr.includes('/')) {
           const parts = dataLaudoStr.split('/')
@@ -286,7 +301,6 @@ export default function UploadPage() {
         } else {
           dataLaudo = new Date(dataLaudoStr)
         }
-
         return {
           dataLancamento: dataLaudo.toISOString(),
           os: (edited.ordemServico as string) || item.ordemServico,
@@ -298,20 +312,14 @@ export default function UploadPage() {
           dataVencimento: addDays(dataLaudo, 30).toISOString(),
         }
       })
-
       const response = await fetch('/api/records', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ records, fileName: 'upload-os.jpg' }),
       })
-
       const data = await response.json()
-
       if (response.ok) {
-        setResult({
-          type: 'success',
-          message: `✅ ${data.count} registro(s) salvos com sucesso!`,
-        })
+        setResult({ type: 'success', message: `✅ ${data.count} registro(s) salvos com sucesso!` })
         setOsData([])
         setOsEdits({})
         setImagePreview(null)
@@ -330,7 +338,6 @@ export default function UploadPage() {
     if (!repasseData) return
     setConfirming(true)
     setError(null)
-
     try {
       const response = await fetch('/api/confirm-payment', {
         method: 'POST',
@@ -341,15 +348,12 @@ export default function UploadPage() {
           fileName: 'upload-repasse.jpg',
         }),
       })
-
       const data = await response.json()
-
       if (response.ok) {
         const details = [
           data.atualizados.length > 0 ? `✅ ${data.atualizados.length} registro(s) atualizado(s)` : '',
           data.naoEncontrados.length > 0 ? `⚠️ ${data.naoEncontrados.length} OS não encontrada(s): ${data.naoEncontrados.join(', ')}` : '',
         ].filter(Boolean).join('\n')
-
         setResult({
           type: data.naoEncontrados.length > 0 ? 'partial' : 'success',
           message: `Pagamento confirmado!`,
@@ -376,14 +380,19 @@ export default function UploadPage() {
     setError(null)
     setResult(null)
     setBatchImages([])
-    setBatchProcessing(false)
-    setBatchPaused(false)
-    setBatchComplete(false)
-    batchPausedRef.current = false
+    setBatchPhase('upload')
+    setActiveClassifyIndex(0)
+    batchAbortRef.current = true
     batchRunIdRef.current += 1
-    setActiveClassifyIndex(-1)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
+
+  // ─── Computed values ──────────────────────────────────────────────
+  const osCount = batchImages.filter(img => img.type === 'OS').length
+  const repasseCount = batchImages.filter(img => img.type === 'REPASSE').length
+  const processedCount = batchImages.filter(img => img.status === 'success' || img.status === 'duplicate').length
+  const errorCount = batchImages.filter(img => img.status === 'error').length
+  const quotaCount = batchImages.filter(img => img.status === 'quota_exceeded').length
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -406,281 +415,146 @@ export default function UploadPage() {
         <button
           onClick={() => { setMode('OS'); resetAll() }}
           className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
-            mode === 'OS'
-              ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10'
-              : 'text-slate-400 hover:text-slate-300'
+            mode === 'OS' ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10' : 'text-slate-400 hover:text-slate-300'
           }`}
           id="btn-mode-os"
-        >
-          📋 Lançar OS
-        </button>
+        >📋 Lançar OS</button>
         <button
           onClick={() => { setMode('REPASSE'); resetAll() }}
           className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
-            mode === 'REPASSE'
-              ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10'
-              : 'text-slate-400 hover:text-slate-300'
+            mode === 'REPASSE' ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10' : 'text-slate-400 hover:text-slate-300'
           }`}
           id="btn-mode-repasse"
-        >
-          💳 Confirmar Pagamento
-        </button>
+        >💳 Confirmar Pagamento</button>
         <button
           onClick={() => { setMode('LOTE'); resetAll() }}
           className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
-            mode === 'LOTE'
-              ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10'
-              : 'text-slate-400 hover:text-slate-300'
+            mode === 'LOTE' ? 'bg-teal-500/20 text-teal-400 shadow-lg shadow-teal-500/10' : 'text-slate-400 hover:text-slate-300'
           }`}
           id="btn-mode-lote"
-        >
-          📤 Upload em Massa
-        </button>
+        >📤 Upload em Massa</button>
       </div>
 
-      {/* Upload Zone */}
+      {/* Upload Zone (individual) */}
       {mode !== 'LOTE' && !imagePreview && !result && (
-        <div
-          className="upload-zone p-8 sm:p-12 text-center"
-          onClick={() => fileInputRef.current?.click()}
+        <div className="upload-zone p-8 sm:p-12 text-center" onClick={() => fileInputRef.current?.click()}
           onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('dragging') }}
           onDragLeave={(e) => { e.preventDefault(); e.currentTarget.classList.remove('dragging') }}
-          onDrop={(e) => {
-            e.preventDefault()
-            e.currentTarget.classList.remove('dragging')
-            const file = e.dataTransfer.files[0]
-            if (file) {
-              const dt = new DataTransfer()
-              dt.items.add(file)
-              if (fileInputRef.current) {
-                fileInputRef.current.files = dt.files
-                fileInputRef.current.dispatchEvent(new Event('change', { bubbles: true }))
-              }
-            }
-          }}
+          onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove('dragging'); const file = e.dataTransfer.files[0]; if (file) { const dt = new DataTransfer(); dt.items.add(file); if (fileInputRef.current) { fileInputRef.current.files = dt.files; fileInputRef.current.dispatchEvent(new Event('change', { bubbles: true })) } } }}
           id="upload-zone"
         >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            capture="environment"
-            onChange={handleFileSelect}
-            className="hidden"
-            id="file-input"
-          />
-          <div className="text-5xl mb-4">
-            {mode === 'OS' ? '📸' : '📄'}
-          </div>
-          <p className="text-slate-300 font-medium mb-2">
-            {mode === 'OS'
-              ? 'Tire uma foto da tela do iQuery'
-              : 'Tire uma foto da listagem de repasse'}
-          </p>
-          <p className="text-slate-500 text-sm mb-4">
-            Arraste e solte ou clique para selecionar
-          </p>
-          <button className="btn btn-primary btn-sm">
-            Selecionar Imagem
-          </button>
+          <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleFileSelect} className="hidden" id="file-input" />
+          <div className="text-5xl mb-4">{mode === 'OS' ? '📸' : '📄'}</div>
+          <p className="text-slate-300 font-medium mb-2">{mode === 'OS' ? 'Tire uma foto da tela do iQuery' : 'Tire uma foto da listagem de repasse'}</p>
+          <p className="text-slate-500 text-sm mb-4">Arraste e solte ou clique para selecionar</p>
+          <button className="btn btn-primary btn-sm">Selecionar Imagem</button>
         </div>
       )}
 
-      {/* LOTE Upload Zone */}
-      {mode === 'LOTE' && !batchImages.length && !batchComplete && (
-        <div
-          className="upload-zone p-8 sm:p-12 text-center"
+      {/* ═══ BATCH PHASE 1: Upload ═══ */}
+      {mode === 'LOTE' && batchPhase === 'upload' && (
+        <div className="upload-zone p-8 sm:p-12 text-center"
           onClick={() => document.getElementById('batch-file-input')?.click()}
           onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('dragging') }}
           onDragLeave={(e) => { e.preventDefault(); e.currentTarget.classList.remove('dragging') }}
-          onDrop={(e) => {
-            e.preventDefault()
-            e.currentTarget.classList.remove('dragging')
-            const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'))
-            if (files.length > 0) {
-              handleBatchFileSelect(files)
-            }
-          }}
+          onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove('dragging'); const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/')); if (files.length > 0) handleBatchFileSelect(files) }}
           id="batch-upload-zone"
         >
-          <input
-            type="file"
-            accept="image/*"
-            multiple
-            onChange={(e) => {
-               if (e.target.files) handleBatchFileSelect(Array.from(e.target.files))
-               // Reset input value to allow selecting same files again if cleared
-               e.target.value = ''
-            }}
-            className="hidden"
-            id="batch-file-input"
-          />
-          <div className="text-5xl mb-4">
-            📤
-          </div>
-          <p className="text-slate-300 font-medium mb-2">
-            Selecione ou arraste várias imagens
-          </p>
-          <p className="text-slate-500 text-sm mb-4">
-            Envie múltiplas telas para processamento em lote
-          </p>
-          <button className="btn btn-primary btn-sm">
-            Selecionar Imagens
-          </button>
+          <input type="file" accept="image/*" multiple onChange={(e) => { if (e.target.files) handleBatchFileSelect(Array.from(e.target.files)); e.target.value = '' }} className="hidden" id="batch-file-input" />
+          <div className="text-5xl mb-4">📤</div>
+          <p className="text-slate-300 font-medium mb-2">Selecione ou arraste várias imagens</p>
+          <p className="text-slate-500 text-sm mb-4">Envie múltiplas telas para processamento em lote</p>
+          <button className="btn btn-primary btn-sm">Selecionar Imagens</button>
         </div>
       )}
 
-      {/* Tinder Classification UI */}
-      {mode === 'LOTE' && batchImages.length > 0 && activeClassifyIndex >= 0 && activeClassifyIndex < batchImages.length && (
+      {/* ═══ BATCH PHASE 2: Classification (Tinder UI) ═══ */}
+      {mode === 'LOTE' && batchPhase === 'classify' && batchImages.length > 0 && (
         <div className="glass-card overflow-hidden animate-slide-up flex flex-col items-center">
           <div className="w-full p-4 border-b border-slate-700/30 flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-slate-200">
-              Classificação Manual
-            </h2>
-            <span className="text-sm text-slate-400">
-              Imagem {activeClassifyIndex + 1} de {batchImages.length}
-            </span>
+            <div className="flex items-center gap-3">
+              <h2 className="text-lg font-semibold text-slate-200">Classificação Manual</h2>
+              {activeClassifyIndex > 0 && (
+                <button onClick={goBackClassification} className="text-sm text-slate-400 hover:text-slate-200 transition-colors px-2 py-1 rounded-lg hover:bg-slate-700/50">← Voltar</button>
+              )}
+            </div>
+            <span className="text-sm text-slate-400">Imagem {activeClassifyIndex + 1} de {batchImages.length}</span>
           </div>
-          
           <div className="p-4 w-full flex-1 flex flex-col items-center justify-center bg-slate-900/50 min-h-[40vh]">
-            <img 
-              src={batchImages[activeClassifyIndex].preview} 
-              alt="Classificando..." 
-              className="max-h-[65vh] object-contain rounded-xl shadow-2xl border border-slate-700/50"
-            />
+            <img src={batchImages[activeClassifyIndex]?.preview} alt="Classificando..." className="max-h-[65vh] object-contain rounded-xl shadow-2xl border border-slate-700/50" />
           </div>
-
           <div className="p-6 w-full flex justify-center gap-4 border-t border-slate-700/30 bg-slate-800/20">
-            <button 
-              onClick={() => {
-                const nextIndex = activeClassifyIndex + 1
-                setBatchImages(prev => prev.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'OS' as const, status: 'queued' as const } : img))
-                setActiveClassifyIndex(nextIndex)
-                if (nextIndex >= batchImages.length) {
-                  setTimeout(() => {
-                     const updatedBatch = batchImages.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'OS' as const, status: 'queued' as const } : img)
-                     processBatch(updatedBatch as BatchImage[])
-                  }, 0)
-                }
-              }}
-              className="flex-1 py-4 md:py-6 text-xl md:text-2xl font-bold rounded-xl bg-teal-500/10 text-teal-400 hover:bg-teal-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all border border-teal-500/30 shadow-lg shadow-teal-500/10"
-            >
-              📋 OS
-            </button>
-            <button 
-              onClick={() => {
-                const nextIndex = activeClassifyIndex + 1
-                setBatchImages(prev => prev.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'REPASSE' as const, status: 'queued' as const } : img))
-                setActiveClassifyIndex(nextIndex)
-                if (nextIndex >= batchImages.length) {
-                  setTimeout(() => {
-                     const updatedBatch = batchImages.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'REPASSE' as const, status: 'queued' as const } : img)
-                     processBatch(updatedBatch as BatchImage[])
-                  }, 0)
-                }
-              }}
-              className="flex-1 py-4 md:py-6 text-xl md:text-2xl font-bold rounded-xl bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all border border-indigo-500/30 shadow-lg shadow-indigo-500/10"
-            >
-              💳 Repasse
-            </button>
+            <button onClick={() => classifyCurrentImage('OS')} className="flex-1 py-4 md:py-6 text-xl md:text-2xl font-bold rounded-xl bg-teal-500/10 text-teal-400 hover:bg-teal-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all border border-teal-500/30 shadow-lg shadow-teal-500/10">📋 OS</button>
+            <button onClick={() => classifyCurrentImage('REPASSE')} className="flex-1 py-4 md:py-6 text-xl md:text-2xl font-bold rounded-xl bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all border border-indigo-500/30 shadow-lg shadow-indigo-500/10">💳 Repasse</button>
           </div>
         </div>
       )}
 
-      {/* Batch Queue UI */}
-      {mode === 'LOTE' && batchImages.length > 0 && activeClassifyIndex >= batchImages.length && !batchComplete && (
+      {/* ═══ BATCH PHASE 3: Review ═══ */}
+      {mode === 'LOTE' && batchPhase === 'review' && (
         <div className="glass-card overflow-hidden animate-slide-up">
-          <div className="p-4 border-b border-slate-700/30 sm:flex items-center justify-between space-y-4 sm:space-y-0">
-            <div>
-              <h2 className="text-lg font-semibold text-slate-200">
-                Lote de Imagens ({batchImages.length})
-                {batchPaused && batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') ? (
-                  <span className="ml-3 text-amber-400 text-sm animate-pulse">
-                    ⚠️ Pausado: Classifique as pendentes
-                  </span>
-                ) : batchPaused ? (
-                  <span className="ml-3 text-emerald-400 text-sm animate-pulse">
-                    ✅ Classificação concluída. Revise e Inicie o Salvamento.
-                  </span>
-                ) : null}
-              </h2>
-              <div className="flex items-center gap-2 mt-2">
-                <div className="w-48 bg-slate-700/50 rounded-full h-2 overflow-hidden">
-                  <div className="h-full bg-teal-500 rounded-full transition-all duration-500 ease-out" 
-                      style={{ 
-                      width: `${(batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing' && i.status !== 'classifying').length / batchImages.length) * 100}%` 
-                      }} 
-                    />
-                </div>
-                <span className="text-xs text-slate-400">
-                  {batchImages.filter(i => i.status !== 'queued' && i.status !== 'processing' && i.status !== 'classifying').length} / {batchImages.length}
-                </span>
-              </div>
+          <div className="p-4 border-b border-slate-700/30">
+            <h2 className="text-lg font-semibold text-slate-200">Revisão do Lote ({batchImages.length} imagens)</h2>
+            <div className="flex items-center gap-4 mt-2 text-sm">
+              <span className="text-teal-400 font-medium">📋 {osCount} OS</span>
+              <span className="text-indigo-400 font-medium">💳 {repasseCount} Repasse</span>
             </div>
-            
-            <div className="flex gap-2 flex-wrap">
-              {!batchProcessing && !batchPaused && batchImages.some(i => i.status === 'queued' && !i.type) && (
-                <button onClick={() => processBatch()} className="btn btn-primary btn-sm">
-                  ▶️ Iniciar Processamento
-                </button>
-              )}
-              {batchProcessing && !batchPaused && (
-                <button onClick={() => {
-                  batchPausedRef.current = true
-                  setBatchPaused(true)
-                }} className="btn btn-secondary btn-sm">
-                  ⏸️ Pausar
-                </button>
-              )}
-              {batchPaused && batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') && (
-                <button disabled className="btn btn-primary btn-sm opacity-50 cursor-not-allowed">
-                  ⚠️ Classifique as pendentes
-                </button>
-              )}
-              {batchPaused && !batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') && (
-                <button onClick={() => {
-                  setBatchPaused(false)
-                  batchPausedRef.current = false
-                  processBatch()
-                }} className="btn btn-primary btn-sm animate-pulse">
-                  ▶️ Iniciar Salvamento
-                </button>
-              )}
-              <button onClick={resetAll} className="btn btn-ghost btn-sm text-slate-400 hover:text-rose-400">
-                🗑️ Limpar
-              </button>
+            <p className="text-slate-500 text-xs mt-2">
+              ⚡ O Gemini 2.5 Flash permite até 20 processamentos por dia.{' '}
+              {batchImages.length > 20
+                ? `Serão processadas as primeiras 20 imagens. As ${batchImages.length - 20} restantes poderão ser reprocessadas amanhã.`
+                : `Você tem ${batchImages.length} imagens — dentro do limite.`}
+            </p>
+          </div>
+          <div className="p-2 space-y-2 max-h-[50vh] overflow-y-auto">
+            {batchImages.map((img, idx) => (
+              <div key={img.id} className="flex items-center gap-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
+                <img src={img.preview} alt={img.file.name} className="w-16 h-16 rounded-lg object-cover cursor-pointer hover:opacity-80 transition-opacity" onClick={() => setZoomedImage(img.preview)} />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-slate-200 truncate">{img.file.name}</p>
+                  <span className={`text-xs font-semibold mt-1 inline-block px-2 py-0.5 rounded-full ${img.type === 'OS' ? 'bg-teal-500/20 text-teal-400' : 'bg-indigo-500/20 text-indigo-400'}`}>
+                    {img.type === 'OS' ? '📋 OS' : '💳 Repasse'}
+                  </span>
+                </div>
+                <div className="flex gap-1">
+                  <button onClick={() => setBatchImages(prev => prev.map((i, j) => j === idx ? { ...i, type: 'OS' as const } : i))} className={`px-2 py-1 rounded text-xs font-medium transition-colors ${img.type === 'OS' ? 'bg-teal-500/30 text-teal-300' : 'bg-slate-700/50 text-slate-400 hover:bg-teal-500/20 hover:text-teal-400'}`}>OS</button>
+                  <button onClick={() => setBatchImages(prev => prev.map((i, j) => j === idx ? { ...i, type: 'REPASSE' as const } : i))} className={`px-2 py-1 rounded text-xs font-medium transition-colors ${img.type === 'REPASSE' ? 'bg-indigo-500/30 text-indigo-300' : 'bg-slate-700/50 text-slate-400 hover:bg-indigo-500/20 hover:text-indigo-400'}`}>Repasse</button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="p-4 border-t border-slate-700/30 flex gap-3">
+            <button onClick={resetAll} className="btn btn-secondary flex-1">🗑️ Cancelar</button>
+            <button onClick={startProcessing} className="btn btn-primary flex-1">▶️ Iniciar Processamento</button>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ BATCH PHASE 4: Processing ═══ */}
+      {mode === 'LOTE' && batchPhase === 'processing' && (
+        <div className="glass-card overflow-hidden animate-slide-up">
+          <div className="p-4 border-b border-slate-700/30">
+            <h2 className="text-lg font-semibold text-slate-200">Processando Lote...</h2>
+            <div className="flex items-center gap-2 mt-2">
+              <div className="flex-1 bg-slate-700/50 rounded-full h-2.5 overflow-hidden">
+                <div className="h-full bg-teal-500 rounded-full transition-all duration-500 ease-out" style={{ width: `${(processedCount / batchImages.length) * 100}%` }} />
+              </div>
+              <span className="text-sm text-slate-400 tabular-nums">{processedCount} / {batchImages.length}</span>
             </div>
           </div>
-          
           <div className="p-2 space-y-2 max-h-[60vh] overflow-y-auto">
             {batchImages.map(img => (
               <div key={img.id} className="flex items-center gap-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
-                <img 
-                  src={img.preview} 
-                  alt={img.file.name} 
-                  className="w-12 h-12 rounded object-cover cursor-pointer hover:opacity-80 transition-opacity" 
-                  onClick={() => setZoomedImage(img.preview)}
-                />
+                <img src={img.preview} alt={img.file.name} className="w-12 h-12 rounded object-cover cursor-pointer hover:opacity-80 transition-opacity" onClick={() => setZoomedImage(img.preview)} />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-slate-200 truncate">{img.file.name}</p>
                   <div className="text-xs mt-1">
-                    {img.status === 'queued' && <span className="text-slate-400">⏳ Na fila {img.type && img.type !== 'UNKNOWN' && <span className="text-teal-400 ml-1 font-medium">[{img.type}]</span>}</span>}
-                    {img.status === 'classifying' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Analisando tipo...</span>}
+                    {img.status === 'queued' && <span className="text-slate-400">⏳ Na fila <span className="text-teal-400 ml-1 font-medium">[{img.type}]</span></span>}
                     {img.status === 'processing' && <span className="text-teal-400 flex items-center gap-1"><div className="spinner !w-3 !h-3 !border-2" /> Processando...</span>}
                     {img.status === 'success' && <span className="text-emerald-400">✅ {img.type} - {img.type === 'OS' ? `${img.recordsCreated} salvos` : `${img.recordsUpdated} atualizados`}</span>}
                     {img.status === 'duplicate' && <span className="text-amber-400">⚠️ Duplicatas ignoradas ({img.duplicatesSkipped})</span>}
                     {img.status === 'error' && <span className="text-rose-400">❌ {img.error}</span>}
-                    {img.status === 'unknown_type' && (
-                      <div className="flex items-center gap-2 flex-wrap mt-1">
-                        <span className="text-amber-400">❓ Tipo não reconhecido</span>
-                        <button onClick={() => {
-                          setBatchImages(prev => prev.map(i => i.id === img.id ? { ...i, type: 'OS', status: 'queued' } : i))
-                        }} className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 hover:bg-teal-500/20 hover:text-teal-400 transition-colors">📋 OS</button>
-                        <button onClick={() => {
-                          setBatchImages(prev => prev.map(i => i.id === img.id ? { ...i, type: 'REPASSE', status: 'queued' } : i))
-                        }} className="px-2 py-0.5 rounded bg-slate-700 text-slate-300 hover:bg-teal-500/20 hover:text-teal-400 transition-colors">💳 Repasse</button>
-                      </div>
-                    )}
+                    {img.status === 'quota_exceeded' && <span className="text-amber-400">⏸️ Cota diária esgotada — pendente</span>}
                   </div>
                 </div>
               </div>
@@ -689,103 +563,69 @@ export default function UploadPage() {
         </div>
       )}
 
-      {/* Batch Summary */}
-      {mode === 'LOTE' && batchComplete && (
+      {/* ═══ BATCH PHASE 5: Done (Summary) ═══ */}
+      {mode === 'LOTE' && batchPhase === 'done' && (
         <div className="glass-card p-6 animate-slide-up border-teal-500/30 bg-teal-500/5">
           <div className="text-center mb-6">
-            <h2 className="text-2xl font-bold text-slate-100">Lote Concluído! 🎉</h2>
-            <p className="text-slate-400 mt-1">Veja o resumo do processamento abaixo</p>
+            <h2 className="text-2xl font-bold text-slate-100">{quotaCount > 0 ? 'Lote Parcialmente Concluído ⚠️' : 'Lote Concluído! 🎉'}</h2>
+            <p className="text-slate-400 mt-1">{quotaCount > 0 ? `A cota diária do Gemini foi atingida. ${processedCount} de ${batchImages.length} imagens foram processadas.` : 'Veja o resumo do processamento abaixo'}</p>
           </div>
-          
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-6">
             <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700/30 text-center">
               <div className="text-3xl font-bold text-slate-200">{batchImages.length}</div>
               <div className="text-xs text-slate-400 mt-1 uppercase tracking-wider">Imagens</div>
             </div>
             <div className="bg-emerald-500/10 p-4 rounded-xl border border-emerald-500/20 text-center">
-              <div className="text-3xl font-bold text-emerald-400">
-                {batchImages.reduce((acc, img) => acc + (img.recordsCreated || 0), 0)}
-              </div>
+              <div className="text-3xl font-bold text-emerald-400">{batchImages.reduce((acc, img) => acc + (img.recordsCreated || 0), 0)}</div>
               <div className="text-xs text-emerald-500/70 mt-1 uppercase tracking-wider">OS Criadas</div>
             </div>
             <div className="bg-emerald-500/10 p-4 rounded-xl border border-emerald-500/20 text-center">
-              <div className="text-3xl font-bold text-emerald-400">
-                {batchImages.reduce((acc, img) => acc + (img.recordsUpdated || 0), 0)}
-              </div>
+              <div className="text-3xl font-bold text-emerald-400">{batchImages.reduce((acc, img) => acc + (img.recordsUpdated || 0), 0)}</div>
               <div className="text-xs text-emerald-500/70 mt-1 uppercase tracking-wider">Repasses Atualizados</div>
             </div>
             <div className="bg-amber-500/10 p-4 rounded-xl border border-amber-500/20 text-center">
-              <div className="text-3xl font-bold text-amber-400">
-                {batchImages.reduce((acc, img) => acc + (img.duplicatesSkipped || 0), 0)}
-              </div>
+              <div className="text-3xl font-bold text-amber-400">{batchImages.reduce((acc, img) => acc + (img.duplicatesSkipped || 0), 0)}</div>
               <div className="text-xs text-amber-500/70 mt-1 uppercase tracking-wider">Duplicadas</div>
             </div>
-            <div className="bg-rose-500/10 p-4 rounded-xl border border-rose-500/20 text-center">
-              <div className="text-3xl font-bold text-rose-400">
-                {batchImages.filter(img => img.status === 'error' || img.status === 'unknown_type').length}
+            {errorCount > 0 && (
+              <div className="bg-rose-500/10 p-4 rounded-xl border border-rose-500/20 text-center">
+                <div className="text-3xl font-bold text-rose-400">{errorCount}</div>
+                <div className="text-xs text-rose-500/70 mt-1 uppercase tracking-wider">Erros</div>
               </div>
-              <div className="text-xs text-rose-500/70 mt-1 uppercase tracking-wider">Erros/Pendentes</div>
-            </div>
-          </div>
-          
-          <div className="flex justify-center gap-3 flex-wrap">
-            {batchImages.some(img => img.status === 'error') && (
-              <button onClick={() => {
-                const retryImages = batchImages.filter(img => img.status === 'error').map(img => ({ ...img, status: 'queued' as const, error: undefined }))
-                setBatchImages(prev => prev.map(img => img.status === 'error' ? { ...img, status: 'queued', error: undefined } : img))
-                processBatch(retryImages)
-              }} className="btn btn-secondary">
-                🔄 Reprocessar Falhas
-              </button>
             )}
-            <button onClick={resetAll} className="btn btn-secondary">
-              Novo Lote
-            </button>
-            <button onClick={() => router.push('/dashboard')} className="btn btn-primary">
-              Ver Dashboard
-            </button>
+            {quotaCount > 0 && (
+              <div className="bg-amber-500/10 p-4 rounded-xl border border-amber-500/20 text-center">
+                <div className="text-3xl font-bold text-amber-400">{quotaCount}</div>
+                <div className="text-xs text-amber-500/70 mt-1 uppercase tracking-wider">Pendentes (Cota)</div>
+              </div>
+            )}
+          </div>
+          <div className="flex justify-center gap-3 flex-wrap">
+            {(errorCount > 0 || quotaCount > 0) && (
+              <button onClick={retryFailed} className="btn btn-secondary">🔄 Reprocessar Pendentes</button>
+            )}
+            <button onClick={resetAll} className="btn btn-secondary">Novo Lote</button>
+            <button onClick={() => router.push('/dashboard')} className="btn btn-primary">Ver Dashboard</button>
           </div>
         </div>
       )}
 
-      {/* Image Preview */}
+      {/* Image Preview (individual upload) */}
       {imagePreview && !osData.length && !repasseData && !result && (
         <div className="glass-card p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold text-slate-200">Prévia da Imagem</h2>
-            <button onClick={resetAll} className="btn btn-ghost btn-sm">
-              ✕ Remover
-            </button>
+            <button onClick={resetAll} className="btn btn-ghost btn-sm">✕ Remover</button>
           </div>
           <div className="rounded-xl overflow-hidden border border-slate-700/30 mb-4">
-            <img
-              src={imagePreview}
-              alt="Preview"
-              className="w-full max-h-[400px] object-contain bg-black/20"
-            />
+            <img src={imagePreview} alt="Preview" className="w-full max-h-[400px] object-contain bg-black/20" />
           </div>
           <div className="flex gap-3">
-            <button
-              onClick={handleExtract}
-              disabled={extracting}
-              className="btn btn-primary flex-1"
-              id="btn-extract"
-            >
-              {extracting ? (
-                <>
-                  <div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />
-                  Processando com IA...
-                </>
-              ) : (
-                <>🤖 Extrair Dados com IA</>
-              )}
+            <button onClick={handleExtract} disabled={extracting} className="btn btn-primary flex-1" id="btn-extract">
+              {extracting ? (<><div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />Processando com IA...</>) : (<>🤖 Extrair Dados com IA</>)}
             </button>
           </div>
-          {extracting && (
-            <p className="text-center text-slate-400 text-sm mt-3 animate-pulse">
-              Aguarde, a IA está analisando a imagem... Isso pode levar alguns segundos.
-            </p>
-          )}
+          {extracting && (<p className="text-center text-slate-400 text-sm mt-3 animate-pulse">Aguarde, a IA está analisando a imagem... Isso pode levar alguns segundos.</p>)}
         </div>
       )}
 
@@ -796,9 +636,7 @@ export default function UploadPage() {
             <span className="text-xl">❌</span>
             <div>
               <p className="text-rose-400 font-medium">{error}</p>
-              <button onClick={resetAll} className="btn btn-ghost btn-sm mt-2 text-slate-400">
-                Tentar novamente
-              </button>
+              <button onClick={resetAll} className="btn btn-ghost btn-sm mt-2 text-slate-400">Tentar novamente</button>
             </div>
           </div>
         </div>
@@ -809,114 +647,37 @@ export default function UploadPage() {
         <div className="glass-card overflow-hidden animate-slide-up">
           <div className="p-4 border-b border-slate-700/30">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-200">
-                📋 Dados Extraídos ({osData.length} registros)
-              </h2>
-              <button onClick={resetAll} className="btn btn-ghost btn-sm">
-                ✕ Cancelar
-              </button>
+              <h2 className="text-lg font-semibold text-slate-200">📋 Dados Extraídos ({osData.length} registros)</h2>
+              <button onClick={resetAll} className="btn btn-ghost btn-sm">✕ Cancelar</button>
             </div>
-            <p className="text-slate-400 text-sm mt-1">
-              Revise os dados antes de confirmar. Clique em um campo para editar.
-            </p>
+            <p className="text-slate-400 text-sm mt-1">Revise os dados antes de confirmar. Clique em um campo para editar.</p>
           </div>
-
           <div className="table-container" style={{ maxHeight: '60vh' }}>
             <table className="data-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Ordem Serviço</th>
-                  <th>Exames OS</th>
-                  <th>Paciente</th>
-                  <th>Empresa</th>
-                  <th>Exame</th>
-                  <th>Data Laudo</th>
-                  <th>Valor</th>
-                </tr>
-              </thead>
+              <thead><tr><th>#</th><th>Ordem Serviço</th><th>Exames OS</th><th>Paciente</th><th>Empresa</th><th>Exame</th><th>Data Laudo</th><th>Valor</th></tr></thead>
               <tbody>
                 {osData.map((item, idx) => {
                   const exame = getEditedOsValue(idx, 'exame', item.exame)
                   return (
                     <tr key={idx}>
                       <td className="text-slate-500 text-xs">{idx + 1}</td>
-                      <td>
-                        <input
-                          type="text"
-                          value={getEditedOsValue(idx, 'ordemServico', item.ordemServico)}
-                          onChange={(e) => updateOsEdit(idx, 'ordemServico', e.target.value)}
-                          className="input py-1 px-2 text-xs w-28"
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="text"
-                          value={getEditedOsValue(idx, 'examesOs', item.examesOs)}
-                          onChange={(e) => updateOsEdit(idx, 'examesOs', e.target.value)}
-                          className="input py-1 px-2 text-xs w-24"
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="text"
-                          value={getEditedOsValue(idx, 'paciente', item.paciente)}
-                          onChange={(e) => updateOsEdit(idx, 'paciente', e.target.value)}
-                          className="input py-1 px-2 text-xs w-48"
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="text"
-                          value={getEditedOsValue(idx, 'empresa', item.empresa)}
-                          onChange={(e) => updateOsEdit(idx, 'empresa', e.target.value)}
-                          className="input py-1 px-2 text-xs w-36"
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="text"
-                          value={exame}
-                          onChange={(e) => updateOsEdit(idx, 'exame', e.target.value)}
-                          className="input py-1 px-2 text-xs w-36"
-                        />
-                      </td>
-                      <td>
-                        <input
-                          type="text"
-                          value={getEditedOsValue(idx, 'dataLaudo', item.dataLaudo)}
-                          onChange={(e) => updateOsEdit(idx, 'dataLaudo', e.target.value)}
-                          className="input py-1 px-2 text-xs w-28"
-                        />
-                      </td>
-                      <td className="font-mono text-teal-400 font-semibold text-xs">
-                        {formatCurrency(getExamPrice(exame))}
-                      </td>
+                      <td><input type="text" value={getEditedOsValue(idx, 'ordemServico', item.ordemServico)} onChange={(e) => updateOsEdit(idx, 'ordemServico', e.target.value)} className="input py-1 px-2 text-xs w-28" /></td>
+                      <td><input type="text" value={getEditedOsValue(idx, 'examesOs', item.examesOs)} onChange={(e) => updateOsEdit(idx, 'examesOs', e.target.value)} className="input py-1 px-2 text-xs w-24" /></td>
+                      <td><input type="text" value={getEditedOsValue(idx, 'paciente', item.paciente)} onChange={(e) => updateOsEdit(idx, 'paciente', e.target.value)} className="input py-1 px-2 text-xs w-48" /></td>
+                      <td><input type="text" value={getEditedOsValue(idx, 'empresa', item.empresa)} onChange={(e) => updateOsEdit(idx, 'empresa', e.target.value)} className="input py-1 px-2 text-xs w-36" /></td>
+                      <td><input type="text" value={exame} onChange={(e) => updateOsEdit(idx, 'exame', e.target.value)} className="input py-1 px-2 text-xs w-36" /></td>
+                      <td><input type="text" value={getEditedOsValue(idx, 'dataLaudo', item.dataLaudo)} onChange={(e) => updateOsEdit(idx, 'dataLaudo', e.target.value)} className="input py-1 px-2 text-xs w-28" /></td>
+                      <td className="font-mono text-teal-400 font-semibold text-xs">{formatCurrency(getExamPrice(exame))}</td>
                     </tr>
                   )
                 })}
               </tbody>
             </table>
           </div>
-
           <div className="p-4 border-t border-slate-700/30 flex gap-3">
-            <button onClick={resetAll} className="btn btn-secondary flex-1">
-              Cancelar
-            </button>
-            <button
-              onClick={handleConfirmOS}
-              disabled={confirming}
-              className="btn btn-primary flex-1"
-              id="btn-confirm-os"
-            >
-              {confirming ? (
-                <>
-                  <div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />
-                  Salvando...
-                </>
-              ) : (
-                `✅ Confirmar ${osData.length} Registro(s)`
-              )}
+            <button onClick={resetAll} className="btn btn-secondary flex-1">Cancelar</button>
+            <button onClick={handleConfirmOS} disabled={confirming} className="btn btn-primary flex-1" id="btn-confirm-os">
+              {confirming ? (<><div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />Salvando...</>) : (`✅ Confirmar ${osData.length} Registro(s)`)}
             </button>
           </div>
         </div>
@@ -927,36 +688,17 @@ export default function UploadPage() {
         <div className="glass-card overflow-hidden animate-slide-up">
           <div className="p-4 border-b border-slate-700/30">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-200">
-                💳 Dados do Repasse ({repasseData.registros.length} registros)
-              </h2>
-              <button onClick={resetAll} className="btn btn-ghost btn-sm">
-                ✕ Cancelar
-              </button>
+              <h2 className="text-lg font-semibold text-slate-200">💳 Dados do Repasse ({repasseData.registros.length} registros)</h2>
+              <button onClick={resetAll} className="btn btn-ghost btn-sm">✕ Cancelar</button>
             </div>
             <div className="flex gap-4 mt-2 text-sm text-slate-400">
               <span>Período: {repasseData.periodoInicio} — {repasseData.periodoFim}</span>
-              <span className="font-mono text-teal-400 font-semibold">
-                Total: {formatCurrency(repasseData.totalRelatorio)}
-              </span>
+              <span className="font-mono text-teal-400 font-semibold">Total: {formatCurrency(repasseData.totalRelatorio)}</span>
             </div>
           </div>
-
           <div className="table-container" style={{ maxHeight: '60vh' }}>
             <table className="data-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>OS</th>
-                  <th>Paciente</th>
-                  <th>Exame</th>
-                  <th>Empresa</th>
-                  <th>Data OS</th>
-                  <th>Bruto</th>
-                  <th>Desc.</th>
-                  <th>Líquido</th>
-                </tr>
-              </thead>
+              <thead><tr><th>#</th><th>OS</th><th>Paciente</th><th>Exame</th><th>Empresa</th><th>Data OS</th><th>Bruto</th><th>Desc.</th><th>Líquido</th></tr></thead>
               <tbody>
                 {repasseData.registros.map((item, idx) => (
                   <tr key={idx}>
@@ -968,33 +710,16 @@ export default function UploadPage() {
                     <td className="text-xs">{item.dataOs}</td>
                     <td className="font-mono text-xs">{formatCurrency(item.valorBruto)}</td>
                     <td className="font-mono text-xs text-rose-400">{formatCurrency(item.desconto)}</td>
-                    <td className="font-mono text-xs font-semibold text-teal-400">
-                      {formatCurrency(item.valorLiquido)}
-                    </td>
+                    <td className="font-mono text-xs font-semibold text-teal-400">{formatCurrency(item.valorLiquido)}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-
           <div className="p-4 border-t border-slate-700/30 flex gap-3">
-            <button onClick={resetAll} className="btn btn-secondary flex-1">
-              Cancelar
-            </button>
-            <button
-              onClick={handleConfirmRepasse}
-              disabled={confirming}
-              className="btn btn-primary flex-1"
-              id="btn-confirm-repasse"
-            >
-              {confirming ? (
-                <>
-                  <div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />
-                  Processando...
-                </>
-              ) : (
-                `💳 Confirmar Pagamento`
-              )}
+            <button onClick={resetAll} className="btn btn-secondary flex-1">Cancelar</button>
+            <button onClick={handleConfirmRepasse} disabled={confirming} className="btn btn-primary flex-1" id="btn-confirm-repasse">
+              {confirming ? (<><div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />Processando...</>) : (`💳 Confirmar Pagamento`)}
             </button>
           </div>
         </div>
@@ -1002,26 +727,13 @@ export default function UploadPage() {
 
       {/* Result Message */}
       {result && (
-        <div className={`glass-card p-6 animate-slide-up ${
-          result.type === 'success' ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-amber-500/30 bg-amber-500/5'
-        }`}>
+        <div className={`glass-card p-6 animate-slide-up ${result.type === 'success' ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-amber-500/30 bg-amber-500/5'}`}>
           <div className="text-center">
             <p className="text-xl font-semibold text-slate-100 mb-2">{result.message}</p>
-            {result.details && (
-              <div className="text-sm text-slate-400 mb-4 whitespace-pre-line">
-                {result.details}
-              </div>
-            )}
+            {result.details && (<div className="text-sm text-slate-400 mb-4 whitespace-pre-line">{result.details}</div>)}
             <div className="flex gap-3 justify-center mt-4">
-              <button onClick={resetAll} className="btn btn-secondary">
-                Novo Upload
-              </button>
-              <button
-                onClick={() => router.push('/dashboard')}
-                className="btn btn-primary"
-              >
-                Ver Dashboard
-              </button>
+              <button onClick={resetAll} className="btn btn-secondary">Novo Upload</button>
+              <button onClick={() => router.push('/dashboard')} className="btn btn-primary">Ver Dashboard</button>
             </div>
           </div>
         </div>
@@ -1029,22 +741,9 @@ export default function UploadPage() {
 
       {/* Zoomed Image Modal */}
       {zoomedImage && (
-        <div 
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 p-4 animate-fade-in"
-          onClick={() => setZoomedImage(null)}
-        >
-          <button 
-            className="absolute top-4 right-4 text-white hover:text-rose-400 text-4xl w-12 h-12 flex items-center justify-center bg-slate-900/50 rounded-full"
-            onClick={() => setZoomedImage(null)}
-          >
-            &times;
-          </button>
-          <img 
-            src={zoomedImage} 
-            alt="Preview Ampliado" 
-            className="max-w-full max-h-[90vh] object-contain rounded-lg shadow-2xl" 
-            onClick={(e) => e.stopPropagation()}
-          />
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/90 p-4 animate-fade-in" onClick={() => setZoomedImage(null)}>
+          <button className="absolute top-4 right-4 text-white hover:text-rose-400 text-4xl w-12 h-12 flex items-center justify-center bg-slate-900/50 rounded-full" onClick={() => setZoomedImage(null)}>&times;</button>
+          <img src={zoomedImage} alt="Preview Ampliado" className="max-w-full max-h-[90vh] object-contain rounded-lg shadow-2xl" onClick={(e) => e.stopPropagation()} />
         </div>
       )}
     </div>

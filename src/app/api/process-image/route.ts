@@ -160,8 +160,11 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error('Process image error:', error)
     const message = error instanceof Error ? error.message : 'Erro ao processar imagem'
+    if (message.startsWith('QUOTA_DAILY_EXCEEDED:')) {
+      return NextResponse.json({ success: false, error: message, quotaType: 'daily' }, { status: 429 })
+    }
     if (message.includes('429') || message.includes('Quota exceeded')) {
-      return NextResponse.json({ success: false, error: message }, { status: 429 })
+      return NextResponse.json({ success: false, error: message, quotaType: 'rpm' }, { status: 429 })
     }
     return NextResponse.json({ success: false, error: message }, { status: 500 })
   }
