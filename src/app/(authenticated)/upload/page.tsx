@@ -139,9 +139,8 @@ export default function UploadPage() {
       return
     }
 
-    // FASE 1.5: Pausa obrigatória se tiver pendências
-    const hasPendingClassification = currentQueue.some(img => img.status === 'unknown_type' || img.status === 'error')
-    if (hasPendingClassification) {
+    // FASE 1.5: Pausa obrigatória para revisão de lote
+    if (unclassified.length > 0) {
       setBatchPaused(true)
       batchPausedRef.current = true
       setBatchProcessing(false)
@@ -556,11 +555,15 @@ export default function UploadPage() {
             <div>
               <h2 className="text-lg font-semibold text-slate-200">
                 Lote de Imagens ({batchImages.length})
-                {batchPaused && batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') && (
+                {batchPaused && batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') ? (
                   <span className="ml-3 text-amber-400 text-sm animate-pulse">
                     ⚠️ Pausado: Classifique as pendentes
                   </span>
-                )}
+                ) : batchPaused ? (
+                  <span className="ml-3 text-emerald-400 text-sm animate-pulse">
+                    ✅ Classificação concluída. Revise e Inicie o Salvamento.
+                  </span>
+                ) : null}
               </h2>
               <div className="flex items-center gap-2 mt-2">
                 <div className="w-48 bg-slate-700/50 rounded-full h-2 overflow-hidden">
@@ -577,7 +580,7 @@ export default function UploadPage() {
             </div>
             
             <div className="flex gap-2 flex-wrap">
-              {!batchProcessing && batchImages.some(i => i.status === 'queued') && (
+              {!batchProcessing && !batchPaused && batchImages.some(i => i.status === 'queued' && !i.type) && (
                 <button onClick={() => processBatch()} className="btn btn-primary btn-sm">
                   ▶️ Iniciar Processamento
                 </button>
@@ -590,13 +593,18 @@ export default function UploadPage() {
                   ⏸️ Pausar
                 </button>
               )}
-              {batchPaused && (
+              {batchPaused && batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') && (
+                <button disabled className="btn btn-primary btn-sm opacity-50 cursor-not-allowed">
+                  ⚠️ Classifique as pendentes
+                </button>
+              )}
+              {batchPaused && !batchImages.some(i => i.status === 'unknown_type' || i.status === 'error') && (
                 <button onClick={() => {
                   setBatchPaused(false)
                   batchPausedRef.current = false
                   processBatch()
                 }} className="btn btn-primary btn-sm animate-pulse">
-                  ▶️ Retomar
+                  ▶️ Iniciar Salvamento
                 </button>
               )}
               <button onClick={resetAll} className="btn btn-ghost btn-sm text-slate-400 hover:text-rose-400">
