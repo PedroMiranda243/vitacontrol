@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@/auth'
 import prisma from '@/lib/db'
-import { extractOSData, extractRepasseData, classifyImageType } from '@/lib/gemini'
+import { extractOSData, extractRepasseData } from '@/lib/gemini'
 import { getExamPrice, addDays, calcStatus } from '@/lib/utils'
 
 export const maxDuration = 60

@@ -39,6 +39,7 @@ export default function UploadPage() {
   const [batchPaused, setBatchPaused] = useState(false)
   const [batchComplete, setBatchComplete] = useState(false)
   const batchPausedRef = useRef(false)
+  const [activeClassifyIndex, setActiveClassifyIndex] = useState(-1)
 
   // Confirmation state
   const [confirming, setConfirming] = useState(false)
@@ -59,21 +60,25 @@ export default function UploadPage() {
 
     if (validFiles.length === 0) return
 
-    validFiles.forEach(file => {
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        const base64 = e.target?.result as string
-        setBatchImages(prev => [
-          ...prev, 
-          { 
-            id: crypto.randomUUID(), 
-            file, 
-            preview: base64, 
-            status: 'queued' 
-          }
-        ])
-      }
-      reader.readAsDataURL(file)
+    Promise.all(validFiles.map(file => {
+      return new Promise<BatchImage>((resolve) => {
+        const reader = new FileReader()
+        reader.onload = (e) => {
+          resolve({
+            id: crypto.randomUUID(),
+            file,
+            preview: e.target?.result as string,
+            status: 'queued'
+          })
+        }
+        reader.readAsDataURL(file)
+      })
+    })).then(images => {
+      setBatchImages(prev => {
+        const newBatch = [...prev, ...images]
+        if (prev.length === 0) setActiveClassifyIndex(0)
+        return newBatch
+      })
     })
   }
 
@@ -86,63 +91,6 @@ export default function UploadPage() {
     let currentQueue = imagesToProcess || batchImages.filter(img => img.status === 'queued')
     
     if (currentQueue.length === 0) {
-      setBatchProcessing(false)
-      return
-    }
-
-    // FASE 1: Classificação
-    const unclassified = currentQueue.filter(img => !img.type || img.type === 'UNKNOWN')
-    for (const image of unclassified) {
-      if (batchPausedRef.current) break
-
-      setBatchImages(prev => prev.map(img => 
-        img.id === image.id ? { ...img, status: 'classifying' as const } : img
-      ))
-
-      try {
-        const response = await fetch('/api/classify-image', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: image.preview }),
-        })
-        const data = await response.json()
-        const newType = data.success ? data.type : 'UNKNOWN'
-
-        setBatchImages(prev => prev.map(img =>
-          img.id === image.id ? {
-            ...img,
-            status: newType === 'UNKNOWN' ? 'unknown_type' as const : 'queued' as const,
-            type: newType
-          } : img
-        ))
-        
-        currentQueue = currentQueue.map(img => 
-          img.id === image.id ? { 
-            ...img, 
-            type: newType, 
-            status: newType === 'UNKNOWN' ? 'unknown_type' as const : 'queued' as const 
-          } : img
-        )
-
-        // Delay na classificação para não estourar o limite de 15 RPM
-        await new Promise(r => setTimeout(r, 6500))
-      } catch (err) {
-        setBatchImages(prev => prev.map(img =>
-          img.id === image.id ? { ...img, status: 'error' as const, error: 'Erro na classificação' } : img
-        ))
-        currentQueue = currentQueue.map(img => img.id === image.id ? { ...img, status: 'error' as const } : img)
-      }
-    }
-
-    if (batchPausedRef.current) {
-      setBatchProcessing(false)
-      return
-    }
-
-    // FASE 1.5: Pausa obrigatória para revisão de lote
-    if (unclassified.length > 0) {
-      setBatchPaused(true)
-      batchPausedRef.current = true
       setBatchProcessing(false)
       return
     }
@@ -400,6 +348,7 @@ export default function UploadPage() {
     setBatchPaused(false)
     setBatchComplete(false)
     batchPausedRef.current = false
+    setActiveClassifyIndex(-1)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -548,8 +497,65 @@ export default function UploadPage() {
         </div>
       )}
 
+      {/* Tinder Classification UI */}
+      {mode === 'LOTE' && batchImages.length > 0 && activeClassifyIndex >= 0 && activeClassifyIndex < batchImages.length && (
+        <div className="glass-card overflow-hidden animate-slide-up flex flex-col items-center">
+          <div className="w-full p-4 border-b border-slate-700/30 flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-slate-200">
+              Classificação Manual
+            </h2>
+            <span className="text-sm text-slate-400">
+              Imagem {activeClassifyIndex + 1} de {batchImages.length}
+            </span>
+          </div>
+          
+          <div className="p-4 w-full flex-1 flex flex-col items-center justify-center bg-slate-900/50 min-h-[40vh]">
+            <img 
+              src={batchImages[activeClassifyIndex].preview} 
+              alt="Classificando..." 
+              className="max-h-[65vh] object-contain rounded-xl shadow-2xl border border-slate-700/50"
+            />
+          </div>
+
+          <div className="p-6 w-full flex justify-center gap-4 border-t border-slate-700/30 bg-slate-800/20">
+            <button 
+              onClick={() => {
+                const nextIndex = activeClassifyIndex + 1
+                setBatchImages(prev => prev.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'OS' as const, status: 'queued' as const } : img))
+                setActiveClassifyIndex(nextIndex)
+                if (nextIndex >= batchImages.length) {
+                  setTimeout(() => {
+                     const updatedBatch = batchImages.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'OS' as const, status: 'queued' as const } : img)
+                     processBatch(updatedBatch as BatchImage[])
+                  }, 0)
+                }
+              }}
+              className="flex-1 py-4 md:py-6 text-xl md:text-2xl font-bold rounded-xl bg-teal-500/10 text-teal-400 hover:bg-teal-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all border border-teal-500/30 shadow-lg shadow-teal-500/10"
+            >
+              📋 OS
+            </button>
+            <button 
+              onClick={() => {
+                const nextIndex = activeClassifyIndex + 1
+                setBatchImages(prev => prev.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'REPASSE' as const, status: 'queued' as const } : img))
+                setActiveClassifyIndex(nextIndex)
+                if (nextIndex >= batchImages.length) {
+                  setTimeout(() => {
+                     const updatedBatch = batchImages.map((img, idx) => idx === activeClassifyIndex ? { ...img, type: 'REPASSE' as const, status: 'queued' as const } : img)
+                     processBatch(updatedBatch as BatchImage[])
+                  }, 0)
+                }
+              }}
+              className="flex-1 py-4 md:py-6 text-xl md:text-2xl font-bold rounded-xl bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 hover:scale-[1.02] active:scale-[0.98] transition-all border border-indigo-500/30 shadow-lg shadow-indigo-500/10"
+            >
+              💳 Repasse
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Batch Queue UI */}
-      {mode === 'LOTE' && batchImages.length > 0 && !batchComplete && (
+      {mode === 'LOTE' && batchImages.length > 0 && activeClassifyIndex >= batchImages.length && !batchComplete && (
         <div className="glass-card overflow-hidden animate-slide-up">
           <div className="p-4 border-b border-slate-700/30 sm:flex items-center justify-between space-y-4 sm:space-y-0">
             <div>
